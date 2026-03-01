@@ -1,0 +1,9 @@
+{
+  "name": "nurture-glow-monorepo",
+  "private": true,
+  "scripts": {
+    "build": "cd frontend && npm install && npx vite build",
+    "dev": "cd frontend && npm run dev",
+    "install:frontend": "cd frontend && npm install"
+  }
+}
