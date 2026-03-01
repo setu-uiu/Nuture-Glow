@@ -1,0 +1,9 @@
+{
+  "name": " Nurture Glow 2.0",
+  "description": "A premium Mother, Pregnancy & Baby Care Platform with voice commands, health tracking, and anonymous community support in English and Bangla.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}

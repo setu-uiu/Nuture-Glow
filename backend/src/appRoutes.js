@@ -1,4 +1,6 @@
-import express from 'express';
+﻿import express from 'express';
+import jwt from 'jsonwebtoken';
+import { z } from 'zod';
 import {
   listCatalog,
   listEntities,
@@ -13,36 +15,64 @@ import {
   deleteEntitiesByTypes,
   seedAppData
 } from './appStore.js';
-import { query } from './db.js';
+import {
+  query,
+  createOrUpdateOAuthToken,
+  getOAuthToken,
+  saveMeetingData,
+  getMeetingData,
+  updateMeetingStatus
+} from './db.js';
 import { normalizeRoleValue, getRoleFilterOptions } from './roles.js';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  getGoogleOAuthUrl,
+  exchangeAuthCodeForTokens,
+  refreshAccessToken,
+  createCalendarEvent,
+  deleteCalendarEvent
+} from './integrations/googleCalendar.js';
+import { handleAiChat } from './services/aiService.js';
+import {
+  parseJson,
+  toTrimmedString,
+  toOptionalString,
+  isPlainObject,
+  normalizeEnumValue,
+  toNonNegativeNumber,
+  toPositiveNumber,
+  isValidId,
+  isValidDateValue,
+  isPastDateValue,
+  createNotification
+} from './utils/index.js';
+import {
+  sendSuccess,
+  sendCreated,
+  sendError,
+  parsePagination,
+  paginationMeta
+} from './utils/response.js';
 
-const DEFAULT_MEETING_URL = 'https://meet.google.com/abc-defg-hij';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const GOOGLE_PROVIDER = 'google';
+if (process.env.NODE_ENV !== 'production') {
+  console.log('[appRoutes] loaded from', new URL(import.meta.url).pathname);
+}
 
-export function createAppRouter({ requireAuth, requireRole, requireConsentForPatient }) {
+export function createAppRouter({
+  requireAuth,
+  requireRole,
+  requireConsentForPatient,
+  verificationDocUpload,
+  buildPublicFileUrl,
+  removeUploadFileByUrl
+}) {
   const router = express.Router();
-
-  const createNotification = async (userId, payload) => {
-    const notification = {
-      userId,
-      type: payload.type,
-      entityId: payload.entityId,
-      title: payload.title,
-      message: payload.message,
-      link: payload.link,
-      isRead: false,
-      createdAt: new Date().toISOString()
-    };
-    await createEntity({ type: 'notification', userId, data: notification });
-  };
-
-  const parseJson = (value, fallback = {}) => {
-    try {
-      return JSON.parse(value || '{}');
-    } catch (err) {
-      return fallback;
-    }
-  };
+  const uploadVerificationDoc =
+    verificationDocUpload && typeof verificationDocUpload.single === 'function'
+      ? verificationDocUpload.single('file')
+      : (req, res, next) => next();
 
   const resolveUserRole = async (req) => {
     if (req.userRole) return req.userRole;
@@ -53,59 +83,17 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     return normalizeRoleValue(rows[0]?.role) || 'mother';
   };
 
-  const isPlainObject = (value) =>
-    value !== null && typeof value === 'object' && !Array.isArray(value);
-
-  const toTrimmedString = (value, maxLen = 5000) => {
-    if (value === null || value === undefined) return '';
-    const str = String(value).trim();
-    if (!str) return '';
-    return str.length > maxLen ? str.slice(0, maxLen) : str;
-  };
-
-  const toOptionalString = (value, maxLen = 5000) => {
-    const str = toTrimmedString(value, maxLen);
-    return str ? str : null;
-  };
-
-  const toNonNegativeNumber = (value) => {
-    const num = Number(value);
-    return Number.isFinite(num) && num >= 0 ? num : null;
-  };
-
-  const toPositiveNumber = (value) => {
-    const num = Number(value);
-    return Number.isFinite(num) && num > 0 ? num : null;
-  };
-
-  const isValidId = (value) => /^[a-zA-Z0-9_-]{2,100}$/.test(String(value || ''));
-
-  const isValidDateValue = (value) => {
-    const date = new Date(value);
-    return Number.isFinite(date.getTime());
-  };
-
-  const isPastDateValue = (value) => {
-    const date = new Date(value);
-    return Number.isFinite(date.getTime()) && date.getTime() < Date.now();
-  };
-
-  const normalizeEnumValue = (value, allowed) => {
-    if (value === null || value === undefined) return null;
-    const str = String(value).trim();
-    if (allowed.has(str)) return str;
-    const lower = str.toLowerCase();
-    for (const item of allowed) {
-      if (String(item).toLowerCase() === lower) {
-        return item;
-      }
-    }
-    return null;
-  };
-
   const allowedAppointmentTypes = new Set(['Online', 'Offline', 'Both']);
   const allowedVaccineStatuses = new Set(['Taken', 'Pending', 'Missed']);
   const allowedMealTypes = new Set(['Breakfast', 'Lunch', 'Dinner', 'Snack']);
+  const allowedVerificationDocTypes = new Set([
+    'NID',
+    'BIRTH_CERT',
+    'MARRIAGE_CERT',
+    'MEDICAL_REPORT'
+  ]);
+  const allowedMerchandiserProductStatuses = new Set(['draft', 'active', 'inactive']);
+  const allowedNutritionPlanStatuses = new Set(['draft', 'active', 'completed']);
 
   const getCatalogItem = async (type, id) => {
     if (!id) return null;
@@ -115,6 +103,184 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     );
     if (!rows.length) return null;
     return parseJson(rows[0].data, {});
+  };
+
+  const DEFAULT_DOCTOR_SLOTS = ['09:00 AM', '10:30 AM', '04:00 PM'];
+
+  const timeStringToMinutes = (value) => {
+    if (!value) return null;
+    const parts = String(value).trim().split(':');
+    if (parts.length < 2) return null;
+    const hours = Number(parts[0]);
+    const minutes = Number(parts[1]);
+    if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+    return hours * 60 + minutes;
+  };
+
+  const slotStringToMinutes = (value) => {
+    if (!value) return null;
+    const raw = String(value).trim().toLowerCase();
+    const match12 = raw.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/);
+    if (match12) {
+      let hours = Number(match12[1]);
+      const minutes = Number(match12[2]);
+      const meridiem = match12[3];
+      if (hours < 1 || hours > 12 || minutes < 0 || minutes > 59) return null;
+      if (meridiem === 'pm' && hours !== 12) hours += 12;
+      if (meridiem === 'am' && hours === 12) hours = 0;
+      return hours * 60 + minutes;
+    }
+    const match24 = raw.match(/^(\d{1,2}):(\d{2})$/);
+    if (match24) {
+      const hours = Number(match24[1]);
+      const minutes = Number(match24[2]);
+      if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+      return hours * 60 + minutes;
+    }
+    return null;
+  };
+
+  const minutesToSlotString = (minutes) => {
+    if (!Number.isFinite(minutes)) return null;
+    const normalized = ((minutes % (24 * 60)) + (24 * 60)) % (24 * 60);
+    const hours24 = Math.floor(normalized / 60);
+    const mins = normalized % 60;
+    const meridiem = hours24 >= 12 ? 'PM' : 'AM';
+    const hours12 = ((hours24 + 11) % 12) + 1;
+    return `${String(hours12).padStart(2, '0')}:${String(mins).padStart(2, '0')} ${meridiem}`;
+  };
+
+  const buildSlotsFromAvailability = (rows) => {
+    if (!rows || !rows.length) return [];
+    const slots = [];
+    rows.forEach((row) => {
+      const startMinutes = timeStringToMinutes(row.start_time || row.startTime);
+      const endMinutes = timeStringToMinutes(row.end_time || row.endTime);
+      const durationRaw = row.slot_duration_minutes ?? row.slotDurationMinutes ?? 30;
+      const duration = Number(durationRaw);
+      if (startMinutes === null || endMinutes === null) return;
+      if (!Number.isFinite(duration) || duration <= 0) return;
+      if (endMinutes <= startMinutes) return;
+      for (let t = startMinutes; t + duration <= endMinutes; t += duration) {
+        const slot = minutesToSlotString(t);
+        if (slot) slots.push(slot);
+      }
+    });
+    const unique = Array.from(new Set(slots));
+    unique.sort((a, b) => {
+      const aMinutes = slotStringToMinutes(a) ?? 0;
+      const bMinutes = slotStringToMinutes(b) ?? 0;
+      return aMinutes - bMinutes;
+    });
+    return unique;
+  };
+
+  const loadDoctorAvailabilitySlots = async (doctorIds = []) => {
+    const slotMap = new Map();
+    const ids = Array.from(new Set(doctorIds.filter(Boolean)));
+    if (!ids.length) return slotMap;
+
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await query(
+      `SELECT doctor_id, start_time, end_time, slot_duration_minutes FROM doctor_availability_slots WHERE doctor_id IN (${placeholders})`,
+      ids
+    );
+
+    const grouped = new Map();
+    rows.forEach((row) => {
+      if (!grouped.has(row.doctor_id)) grouped.set(row.doctor_id, []);
+      grouped.get(row.doctor_id).push(row);
+    });
+
+    grouped.forEach((doctorRows, doctorId) => {
+      const slots = buildSlotsFromAvailability(doctorRows);
+      if (slots.length) {
+        slotMap.set(doctorId, slots);
+      }
+    });
+
+    return slotMap;
+  };
+
+  const resolveDoctorType = (value) => {
+    const status = String(value || '').toLowerCase();
+    if (status.includes('online')) return 'Online';
+    if (status.includes('offline') || status.includes('clinic')) return 'Offline';
+    return 'Both';
+  };
+
+  const mapDoctorRowToCatalog = (row, slotsOverride) => {
+    const feeValue = toNonNegativeNumber(row.fee_amount);
+    const ratingValue = row.rating === null || row.rating === undefined ? null : Number(row.rating);
+    return {
+      id: row.id,
+      name: row.full_name || 'Doctor',
+      specialty: row.specialty_name || row.specialty || 'General',
+      hospital: row.hospital_name || '',
+      location: row.location || '',
+      image: row.image_url || '',
+      fee: Number.isFinite(feeValue) ? feeValue : 0,
+      availableSlots: slotsOverride && slotsOverride.length ? slotsOverride : DEFAULT_DOCTOR_SLOTS,
+      type: resolveDoctorType(row.availability_status),
+      rating: Number.isFinite(ratingValue) ? ratingValue : null
+    };
+  };
+
+  const listRealDoctors = async () => {
+    const rows = await query(
+      `SELECT d.id, d.full_name, d.fee_amount, d.rating, d.availability_status, s.name AS specialty_name
+       FROM doctors d
+       LEFT JOIN doctor_specialties s ON d.specialty_id = s.id
+       ORDER BY d.full_name ASC`
+    );
+    const doctorIds = rows.map((row) => row.id);
+    const slotsMap = await loadDoctorAvailabilitySlots(doctorIds);
+    return rows.map((row) => mapDoctorRowToCatalog(row, slotsMap.get(row.id)));
+  };
+
+  /** Resolve a doctor catalog row by the doctor's LOGIN user_id */
+  const getDoctorByUserId = async (userId) => {
+    if (!userId) return null;
+    const rows = await query(
+      `SELECT d.id, d.user_id, d.full_name, d.fee_amount, d.rating, d.availability_status, s.name AS specialty_name
+       FROM doctors d
+       LEFT JOIN doctor_specialties s ON d.specialty_id = s.id
+       WHERE d.user_id = ?
+       LIMIT 1`,
+      [userId]
+    );
+    if (!rows.length) return null;
+    const slotsMap = await loadDoctorAvailabilitySlots([rows[0].id]);
+    return { ...mapDoctorRowToCatalog(rows[0], slotsMap.get(rows[0].id)), user_id: rows[0].user_id };
+  };
+
+  const getRealDoctorById = async (doctorId) => {
+    if (!doctorId) return null;
+    const rows = await query(
+      `SELECT d.id, d.user_id, d.full_name, d.fee_amount, d.rating, d.availability_status, s.name AS specialty_name
+       FROM doctors d
+       LEFT JOIN doctor_specialties s ON d.specialty_id = s.id
+       WHERE d.id = ?
+       LIMIT 1`,
+      [doctorId]
+    );
+    if (rows.length) {
+      const slotsMap = await loadDoctorAvailabilitySlots([doctorId]);
+      return mapDoctorRowToCatalog(rows[0], slotsMap.get(doctorId));
+    }
+
+    const legacyDoctor = await getCatalogItem('doctor', doctorId);
+    if (!legacyDoctor) return null;
+    const legacySlots = Array.isArray(legacyDoctor.availableSlots)
+      ? legacyDoctor.availableSlots.map((slot) => String(slot))
+      : DEFAULT_DOCTOR_SLOTS;
+    const legacyType = normalizeEnumValue(legacyDoctor.type, allowedAppointmentTypes) || 'Both';
+    return {
+      ...legacyDoctor,
+      availableSlots: legacySlots.length ? legacySlots : DEFAULT_DOCTOR_SLOTS,
+      type: legacyType
+    };
   };
 
   const dayIndexMap = {
@@ -144,7 +310,8 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     if (status === 'completed' || status === 'complete') return 'completed';
     if (status === 'in-progress' || status === 'in progress') return 'in-progress';
     if (status === 'cancelled' || status === 'canceled' || status === 'cancel') return 'cancelled';
-    if (status === 'upcoming' || status === 'scheduled' || status === 'pending') return 'scheduled';
+    if (status === 'pending' || status === 'request' || status === 'requested') return 'pending';
+    if (status === 'upcoming' || status === 'scheduled' || status === 'approved') return 'scheduled';
     return null;
   };
 
@@ -220,10 +387,295 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     return Math.round(rating);
   };
 
+  const isAdminRole = (role) =>
+    role === 'medical_admin' || role === 'ops_admin' || role === 'system_admin';
+
+  const isOnlineAppointment = (appointment) => {
+    if (!appointment) return false;
+    const rawType =
+      appointment.type || appointment.appointmentType || appointment.appointment_type;
+    if (!rawType) return false;
+    return String(rawType).toLowerCase().includes('online');
+  };
+
+  const getAppointmentInfo = async (appointmentId) => {
+    const result = await getMeetingData(appointmentId);
+    if (!result) return null;
+    return {
+      appointment: result.appointment,
+      meetingData: result.meetingData || null
+    };
+  };
+
+  const canAccessAppointment = async (req, appointment, allowAdmin = false) => {
+    const role = await resolveUserRole(req);
+    if (allowAdmin && isAdminRole(role)) return true;
+    const patientId = appointment.patientId || appointment.userId;
+    if (req.user?.sub === patientId) return true;
+    // Check if the logged-in user is the doctor for this appointment
+    const doctorCatalogId = appointment.doctorId;
+    if (doctorCatalogId) {
+      const docRows = await query('SELECT user_id FROM doctors WHERE id = ? LIMIT 1', [doctorCatalogId]);
+      if (docRows.length && docRows[0].user_id === req.user?.sub) return true;
+    }
+    return false;
+  };
+
+  const createMeetingSchema = z.object({
+    appointment_id: z.string().min(2).optional()
+  });
+
+  // Google OAuth: return auth URL for doctors
+  router.get('/integrations/google/auth', requireAuth, async (req, res, next) => {
+    try {
+      const role = await resolveUserRole(req);
+      if (role !== 'doctor') {
+        return res.status(403).json({ success: false, error: 'Doctor access required' });
+      }
+
+      const jwtSecret = process.env.JWT_SECRET;
+      if (!jwtSecret) {
+        return res.status(500).json({ success: false, error: 'JWT secret not configured' });
+      }
+
+      const state = jwt.sign({ sub: req.user.sub, purpose: 'google_oauth' }, jwtSecret, {
+        expiresIn: '10m'
+      });
+      const authUrl = getGoogleOAuthUrl(state);
+      res.json({ auth_url: authUrl });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get('/integrations/google/status', requireAuth, async (req, res, next) => {
+    try {
+      const token = await getOAuthToken(req.user.sub, GOOGLE_PROVIDER);
+      res.json({ connected: Boolean(token?.access_token) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Google OAuth callback
+  router.get('/integrations/google/callback', async (req, res, next) => {
+    try {
+      const code = toTrimmedString(req.query?.code, 4000);
+      const state = toTrimmedString(req.query?.state, 4000);
+      if (!code || !state) {
+        return res.status(400).json({ success: false, error: 'Missing code or state' });
+      }
+
+      const jwtSecret = process.env.JWT_SECRET;
+      if (!jwtSecret) {
+        return res.status(500).json({ success: false, error: 'JWT secret not configured' });
+      }
+
+      let payload;
+      try {
+        payload = jwt.verify(state, jwtSecret);
+      } catch (err) {
+        return res.status(400).json({ success: false, error: 'Invalid OAuth state' });
+      }
+
+      if (!payload || payload.purpose !== 'google_oauth' || !payload.sub) {
+        return res.status(400).json({ success: false, error: 'Invalid OAuth payload' });
+      }
+
+      const tokens = await exchangeAuthCodeForTokens(code);
+      if (!tokens.accessToken) {
+        return res.status(400).json({ success: false, error: 'Failed to obtain access token' });
+      }
+
+      await createOrUpdateOAuthToken(
+        payload.sub,
+        GOOGLE_PROVIDER,
+        tokens.accessToken,
+        tokens.refreshToken,
+        tokens.expiresAt
+      );
+
+      res.redirect(`${FRONTEND_URL}/profile?google_connected=true`);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Video meeting endpoints
+  router.post('/appointments/:id/meeting/create', requireAuth, async (req, res, next) => {
+    try {
+      const appointmentId = req.params.id;
+      if (!isValidId(appointmentId)) {
+        return res.status(400).json({ success: false, error: 'Invalid appointment id' });
+      }
+
+      const parsed = createMeetingSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({ success: false, error: 'Invalid request body' });
+      }
+      if (parsed.data.appointment_id && parsed.data.appointment_id !== appointmentId) {
+        return res.status(400).json({ success: false, error: 'Appointment id mismatch' });
+      }
+
+      const info = await getAppointmentInfo(appointmentId);
+      if (!info) {
+        return res.status(404).json({ success: false, error: 'Appointment not found' });
+      }
+
+      const appointment = info.appointment || {};
+      if (!isOnlineAppointment(appointment)) {
+        return res.status(400).json({ success: false, error: 'Appointment is not online' });
+      }
+
+      const canAccess = await canAccessAppointment(req, appointment, false);
+      if (!canAccess) {
+        return res.status(403).json({ success: false, error: 'Not authorized' });
+      }
+
+      const existingMeeting = info.meetingData || null;
+      if (existingMeeting && existingMeeting.status !== 'cancelled') {
+        return res.json({
+          success: true,
+          data: { meetingData: existingMeeting, appointment },
+          message: 'Video session already exists'
+        });
+      }
+
+      const roomName = `ng-${appointmentId}`;
+      const joinUrl = `${FRONTEND_URL}/appointments/${appointmentId}/video`;
+      const meetingData = {
+        provider: 'webrtc',
+        roomName,
+        joinUrl,
+        status: 'scheduled',
+        createdAt: new Date().toISOString()
+      };
+
+      const updatedAppointment = await saveMeetingData(appointmentId, meetingData);
+      if (!updatedAppointment) {
+        return res.status(500).json({ success: false, error: 'Failed to save meeting' });
+      }
+
+      res.json({
+        success: true,
+        data: { meetingData, appointment: updatedAppointment },
+        message: 'Video session created'
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get('/appointments/:id/meeting', requireAuth, async (req, res, next) => {
+    try {
+      const appointmentId = req.params.id;
+      if (!isValidId(appointmentId)) {
+        return res.status(400).json({ success: false, error: 'Invalid appointment id' });
+      }
+
+      const info = await getAppointmentInfo(appointmentId);
+      if (!info) {
+        return res.status(404).json({ success: false, error: 'Appointment not found' });
+      }
+
+      const appointment = info.appointment || {};
+      const canAccess = await canAccessAppointment(req, appointment, false);
+      if (!canAccess) {
+        return res.status(403).json({ success: false, error: 'Not authorized' });
+      }
+
+      if (!info.meetingData) {
+        return res.status(404).json({ success: false, error: 'Meeting not created yet' });
+      }
+
+      res.json({
+        success: true,
+        data: { meetingData: info.meetingData, appointment }
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Get telemedicine session history for an appointment
+  router.get('/appointments/:id/sessions', requireAuth, async (req, res, next) => {
+    try {
+      const appointmentId = req.params.id;
+      const sessions = await query(
+        `SELECT id, appointment_id, doctor_id, patient_id, started_at, ended_at, duration_seconds, call_type, status, notes, created_at
+         FROM telemedicine_sessions WHERE appointment_id = ? ORDER BY created_at DESC`,
+        [appointmentId]
+      );
+      res.json({ success: true, data: sessions });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/appointments/:id/meeting/cancel', requireAuth, async (req, res, next) => {
+    try {
+      const appointmentId = req.params.id;
+      if (!isValidId(appointmentId)) {
+        return res.status(400).json({ success: false, error: 'Invalid appointment id' });
+      }
+
+      const info = await getAppointmentInfo(appointmentId);
+      if (!info) {
+        return res.status(404).json({ success: false, error: 'Appointment not found' });
+      }
+
+      const appointment = info.appointment || {};
+      const canAccess = await canAccessAppointment(req, appointment, true);
+      if (!canAccess) {
+        return res.status(403).json({ success: false, error: 'Not authorized' });
+      }
+
+      const meetingData = info.meetingData;
+      if (!meetingData) {
+        return res.status(404).json({ success: false, error: 'Meeting not created yet' });
+      }
+
+      await updateMeetingStatus(appointmentId, 'cancelled', { cancelledAt: new Date().toISOString() });
+      res.json({ success: true, message: 'Meeting cancelled' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/appointments/:id/meeting/end', requireAuth, async (req, res, next) => {
+    try {
+      const appointmentId = req.params.id;
+      if (!isValidId(appointmentId)) {
+        return res.status(400).json({ success: false, error: 'Invalid appointment id' });
+      }
+
+      const info = await getAppointmentInfo(appointmentId);
+      if (!info) {
+        return res.status(404).json({ success: false, error: 'Appointment not found' });
+      }
+
+      const appointment = info.appointment || {};
+      const canAccess = await canAccessAppointment(req, appointment, false);
+      if (!canAccess) {
+        return res.status(403).json({ success: false, error: 'Not authorized' });
+      }
+
+      if (!info.meetingData) {
+        return res.status(404).json({ success: false, error: 'Meeting not created yet' });
+      }
+
+      await updateMeetingStatus(appointmentId, 'ended', { endedAt: new Date().toISOString() });
+      res.json({ success: true, message: 'Meeting ended' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   const isReviewableAppointment = (appointment) => {
     if (!appointment) return false;
     const status = String(appointment.status || '').toLowerCase();
     if (status.includes('cancel')) return false;
+    if (status.includes('pending') || status.includes('request')) return false;
     if (status.includes('complete')) return true;
     const scheduledAt = getScheduledAt(appointment);
     if (!scheduledAt) return false;
@@ -410,6 +862,72 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     }
   });
 
+  // ─── User Profile with Emergency Contact ─────────────────────────
+  router.get('/user/:userId/profile', requireAuth, async (req, res, next) => {
+    try {
+      const userId = req.params.userId;
+
+      // Fetch emergency contact from the emergency_contacts table
+      const rows = await query(
+        'SELECT contact_name, phone, relationship FROM emergency_contacts WHERE user_id = ? LIMIT 1',
+        [userId]
+      );
+
+      const emergencyContact = rows.length
+        ? { name: rows[0].contact_name, phone: rows[0].phone, relation: rows[0].relationship }
+        : null;
+
+      res.json({ emergencyContact });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.put('/user/:userId/profile', requireAuth, async (req, res, next) => {
+    try {
+      const userId = req.params.userId;
+      const { emergencyContact } = req.body || {};
+
+      if (emergencyContact) {
+        const { name, phone, relation } = emergencyContact;
+
+        // Check if an emergency contact already exists for this user
+        const existing = await query(
+          'SELECT id FROM emergency_contacts WHERE user_id = ? LIMIT 1',
+          [userId]
+        );
+
+        if (existing.length) {
+          // Update existing
+          await query(
+            'UPDATE emergency_contacts SET contact_name = ?, phone = ?, relationship = ? WHERE user_id = ?',
+            [name || null, phone || null, relation || null, userId]
+          );
+        } else {
+          // Insert new
+          const id = uuidv4();
+          await query(
+            'INSERT INTO emergency_contacts (id, user_id, contact_name, phone, relationship) VALUES (?, ?, ?, ?, ?)',
+            [id, userId, name || null, phone || null, relation || null]
+          );
+        }
+      }
+
+      // Return the saved emergency contact
+      const rows = await query(
+        'SELECT contact_name, phone, relationship FROM emergency_contacts WHERE user_id = ? LIMIT 1',
+        [userId]
+      );
+      const savedContact = rows.length
+        ? { name: rows[0].contact_name, phone: rows[0].phone, relation: rows[0].relationship }
+        : null;
+
+      res.json({ emergencyContact: savedContact });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.get('/user/meta', requireAuth, async (req, res, next) => {
     try {
       const keys = String(req.query.keys || 'hydration,pregnancyWeek,avatar')
@@ -425,7 +943,7 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
 
   router.put('/user/meta', requireAuth, async (req, res, next) => {
     try {
-      const allowed = ['hydration', 'pregnancyWeek', 'avatar'];
+      const allowed = ['hydration', 'pregnancyWeek', 'avatar', 'childDob'];
       const updates = {};
       allowed.forEach((key) => {
         if (req.body?.[key] !== undefined) {
@@ -480,13 +998,15 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
 
   router.get('/appointments', requireAuth, async (req, res, next) => {
     try {
-      const items = await listEntities({ type: 'appointment', userId: req.user.sub });
-      const normalized = items.map((item) => ({
+      const allItems = await listEntities({ type: 'appointment', userId: req.user.sub });
+      const normalized = allItems.map((item) => ({
         ...item,
         status: normalizeAppointmentStatus(item.status) || item.status,
         scheduledAt: item.scheduledAt || getScheduledAt(item)
       }));
-      res.json({ items: normalized });
+      const { page, pageSize, offset } = parsePagination(req, { defaultPageSize: 50 });
+      const items = normalized.slice(offset, offset + pageSize);
+      sendSuccess(res, items, 200, paginationMeta(normalized.length, page, pageSize));
     } catch (err) {
       next(err);
     }
@@ -506,7 +1026,7 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
         return res.status(400).json({ error: 'Invalid doctorId format' });
       }
 
-      const doctor = await getCatalogItem('doctor', doctorId);
+      const doctor = await getRealDoctorById(doctorId);
       if (!doctor) {
         return res.status(404).json({ error: 'Doctor not found' });
       }
@@ -531,13 +1051,15 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
         }
       }
 
-      const normalizedStatus = normalizeAppointmentStatus(data.status) || 'scheduled';
       const appointmentType =
         normalizeEnumValue(data.type, allowedAppointmentTypes) ||
         normalizeEnumValue(doctor.type, allowedAppointmentTypes);
       if (!appointmentType) {
         return res.status(400).json({ error: 'Invalid appointment type' });
       }
+      const isOnlineAppointment = appointmentType === 'Online';
+      const normalizedStatus = normalizeAppointmentStatus(data.status);
+      const effectiveStatus = isOnlineAppointment ? 'pending' : normalizedStatus || 'scheduled';
 
       const payload = {
         ...data,
@@ -548,13 +1070,11 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
         specialty: toTrimmedString(data.specialty, 120) || doctor.specialty || null,
         date,
         time,
-        status: normalizedStatus,
+        status: effectiveStatus,
         scheduledAt,
         type: appointmentType,
         notes: toOptionalString(data.notes, 2000) || undefined,
-        meetingUrl:
-          toOptionalString(data.meetingUrl, 500) ||
-          (String(appointmentType).toLowerCase().includes('online') ? DEFAULT_MEETING_URL : undefined)
+        meetingUrl: toOptionalString(data.meetingUrl, 500)
       };
       const item = await createEntity({
         type: 'appointment',
@@ -566,8 +1086,10 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
       await createNotification(req.user.sub, {
         type: 'APPOINTMENT',
         entityId: item.id,
-        title: 'Appointment Scheduled',
-        message: `Confirmed for ${item.date}.`,
+        title: isOnlineAppointment ? 'Appointment Request Sent' : 'Appointment Scheduled',
+        message: isOnlineAppointment
+          ? `Request submitted for ${item.date}. Awaiting doctor approval.`
+          : `Confirmed for ${item.date}.`,
         link: '/appointments'
       });
 
@@ -575,12 +1097,14 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
       await createNotification(data.doctorId, {
         type: 'NEW_APPOINTMENT',
         entityId: item.id,
-        title: 'New Appointment Request',
-        message: `New appointment scheduled for ${item.date} at ${item.time}.`,
+        title: isOnlineAppointment ? 'New Appointment Request' : 'New Appointment Scheduled',
+        message: isOnlineAppointment
+          ? `New appointment request for ${item.date} at ${item.time}.`
+          : `New appointment scheduled for ${item.date} at ${item.time}.`,
         link: '/doctor/consultations'
       });
 
-      res.status(201).json({ item });
+      res.status(201).json({ success: true, data: item });
     } catch (err) {
       next(err);
     }
@@ -633,7 +1157,7 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
         }
         const nextStatus =
           updates.status || normalizeAppointmentStatus(existing.status) || existing.status;
-        if (nextStatus === 'scheduled' && isPastDateValue(scheduledAt)) {
+        if ((nextStatus === 'scheduled' || nextStatus === 'pending') && isPastDateValue(scheduledAt)) {
           return res.status(400).json({ error: 'Appointment date must be in the future' });
         }
         updates.scheduledAt = scheduledAt;
@@ -697,7 +1221,7 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
         return res.status(400).json({ error: 'Invalid doctorId format' });
       }
 
-      const doctor = await getCatalogItem('doctor', safeDoctorId);
+      const doctor = await getRealDoctorById(safeDoctorId);
       if (!doctor) {
         return res.status(404).json({ error: 'Doctor not found' });
       }
@@ -766,8 +1290,10 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
 
   router.get('/vaccines', requireAuth, async (req, res, next) => {
     try {
-      const items = await listEntities({ type: 'vaccine', userId: req.user.sub });
-      res.json({ items });
+      const allItems = await listEntities({ type: 'vaccine', userId: req.user.sub });
+      const { page, pageSize, offset } = parsePagination(req, { defaultPageSize: 50 });
+      const items = allItems.slice(offset, offset + pageSize);
+      sendSuccess(res, items, 200, paginationMeta(allItems.length, page, pageSize));
     } catch (err) {
       next(err);
     }
@@ -837,6 +1363,16 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     }
   });
 
+  // ── Vaccine Schedule Catalog (live data from DB) ──
+  router.get('/vaccine-schedule', async (req, res, next) => {
+    try {
+      const items = await listCatalog('vaccine_schedule');
+      sendSuccess(res, items);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.get('/nutrition', requireAuth, async (req, res, next) => {
     try {
       const items = await listEntities({ type: 'nutrition_log', userId: req.user.sub });
@@ -879,8 +1415,10 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
 
   router.get('/community/posts', async (req, res, next) => {
     try {
-      const items = await listEntities({ type: 'community_post' });
-      res.json({ items });
+      const allItems = await listEntities({ type: 'community_post' });
+      const { page, pageSize, offset } = parsePagination(req, { defaultPageSize: 20 });
+      const items = allItems.slice(offset, offset + pageSize);
+      sendSuccess(res, items, 200, paginationMeta(allItems.length, page, pageSize));
     } catch (err) {
       next(err);
     }
@@ -1021,8 +1559,10 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
 
   router.get('/journal', requireAuth, async (req, res, next) => {
     try {
-      const items = await listEntities({ type: 'journal_entry', userId: req.user.sub });
-      res.json({ items });
+      const allItems = await listEntities({ type: 'journal_entry', userId: req.user.sub });
+      const { page, pageSize, offset } = parsePagination(req, { defaultPageSize: 20 });
+      const items = allItems.slice(offset, offset + pageSize);
+      sendSuccess(res, items, 200, paginationMeta(allItems.length, page, pageSize));
     } catch (err) {
       next(err);
     }
@@ -1031,6 +1571,10 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
   router.post('/journal', requireAuth, async (req, res, next) => {
     try {
       const data = req.body || {};
+      if (process.env.NODE_ENV !== 'production' && Array.isArray(data.attachments)) {
+        const firstUrlLen = String(data.attachments[0]?.url || '').length;
+        console.log('[journal] incoming attachments', data.attachments.length, 'first url len', firstUrlLen);
+      }
       const content = toTrimmedString(data.content, 4000);
       if (!content) {
         return res.status(400).json({ error: 'content is required' });
@@ -1039,13 +1583,29 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
       if (!isValidDateValue(dateValue)) {
         return res.status(400).json({ error: 'Invalid journal date' });
       }
+      const maxAttachmentUrlLen = 3200000;
+      let attachments = undefined;
+      if (data.attachments !== undefined) {
+        if (!Array.isArray(data.attachments)) {
+          return res.status(400).json({ error: 'attachments must be an array' });
+        }
+        attachments = data.attachments
+          .filter((item) => item && typeof item === 'object')
+          .map((item) => ({
+            name: toTrimmedString(item.name, 200),
+            url: toTrimmedString(item.url, maxAttachmentUrlLen),
+            type: toTrimmedString(item.type, 120)
+          }))
+          .filter((item) => item.name && item.url);
+      }
       const payload = {
         ...data,
         title: toTrimmedString(data.title, 120) || undefined,
         mood: toTrimmedString(data.mood, 40) || undefined,
         content,
         userId: req.user.sub,
-        date: dateValue
+        date: dateValue,
+        attachments
       };
       const item = await createEntity({
         type: 'journal_entry',
@@ -1053,6 +1613,71 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
         data: payload
       });
       res.status(201).json({ item });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.patch('/journal/:id', requireAuth, async (req, res, next) => {
+    try {
+      const existing = await getEntity({
+        id: req.params.id,
+        type: 'journal_entry',
+        userId: req.user.sub
+      });
+      if (!existing) {
+        return res.status(404).json({ error: 'Journal entry not found' });
+      }
+
+      const data = req.body || {};
+      const updates = {};
+
+      if (data.title !== undefined) {
+        updates.title = toOptionalString(data.title, 120);
+      }
+
+      if (data.content !== undefined) {
+        const content = toTrimmedString(data.content, 4000);
+        if (!content) {
+          return res.status(400).json({ error: 'content is required' });
+        }
+        updates.content = content;
+      }
+
+      if (data.mood !== undefined) {
+        updates.mood = toOptionalString(data.mood, 40);
+      }
+
+      if (data.attachments !== undefined) {
+        if (!Array.isArray(data.attachments)) {
+          return res.status(400).json({ error: 'attachments must be an array' });
+        }
+        const maxAttachmentUrlLen = 3200000;
+        const sanitizedAttachments = data.attachments
+          .filter((item) => item && typeof item === 'object')
+          .map((item) => ({
+            name: toTrimmedString(item.name, 200),
+            url: toTrimmedString(item.url, maxAttachmentUrlLen),
+            type: toTrimmedString(item.type, 120)
+          }))
+          .filter((item) => item.name && item.url);
+        updates.attachments = sanitizedAttachments;
+      }
+
+      if (!Object.keys(updates).length) {
+        return res.json({ item: existing });
+      }
+
+      const item = await updateEntity({
+        id: req.params.id,
+        type: 'journal_entry',
+        userId: req.user.sub,
+        data: updates
+      });
+      if (!item) {
+        return res.status(404).json({ error: 'Journal entry not found' });
+      }
+      res.json({ item });
     } catch (err) {
       next(err);
     }
@@ -1073,8 +1698,10 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
 
   router.get('/notifications', requireAuth, async (req, res, next) => {
     try {
-      const items = await listEntities({ type: 'notification', userId: req.user.sub });
-      res.json({ items });
+      const allItems = await listEntities({ type: 'notification', userId: req.user.sub });
+      const { page, pageSize, offset } = parsePagination(req, { defaultPageSize: 50 });
+      const items = allItems.slice(offset, offset + pageSize);
+      sendSuccess(res, items, 200, paginationMeta(allItems.length, page, pageSize));
     } catch (err) {
       next(err);
     }
@@ -1125,12 +1752,31 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     }
   });
 
-  router.put('/profile/docs', requireAuth, async (req, res, next) => {
+  router.put('/profile/docs', requireAuth, uploadVerificationDoc, async (req, res, next) => {
     try {
-      const { type, fileName, fileUrl } = req.body || {};
-      if (!type || !fileUrl) {
-        return res.status(400).json({ error: 'type and fileUrl are required' });
+      const type = toTrimmedString(req.body?.type, 50).toUpperCase();
+      if (!type || !allowedVerificationDocTypes.has(type)) {
+        return res.status(400).json({ error: 'Invalid verification document type' });
       }
+
+      let fileName = toTrimmedString(req.body?.fileName, 255);
+      let fileUrl = toTrimmedString(req.body?.fileUrl, 5000);
+
+      if (req.file) {
+        fileName = toTrimmedString(req.file.originalname, 255) || req.file.filename;
+        fileUrl = buildPublicFileUrl(req, `verification-docs/${req.file.filename}`);
+      }
+
+      if (!type || !fileUrl) {
+        return res.status(400).json({ error: 'type and file are required' });
+      }
+
+      const existing = await getBySubtype({
+        type: 'verification_doc',
+        userId: req.user.sub,
+        subtype: type
+      });
+
       const item = await upsertBySubtype({
         type: 'verification_doc',
         userId: req.user.sub,
@@ -1144,6 +1790,15 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
           uploadedAt: new Date().toISOString()
         }
       });
+
+      if (req.file && existing?.fileUrl && existing.fileUrl !== fileUrl) {
+        try {
+          await removeUploadFileByUrl(existing.fileUrl);
+        } catch (cleanupErr) {
+          console.warn('Failed to clean old verification document:', cleanupErr.message || cleanupErr);
+        }
+      }
+
       res.json({ item });
     } catch (err) {
       next(err);
@@ -1556,7 +2211,7 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
   // ==================== CATALOG ENDPOINTS ====================
   router.get('/catalog/doctors', async (req, res, next) => {
     try {
-      const items = await listCatalog('doctor');
+      const items = await listRealDoctors();
       const summary = await getDoctorReviewSummary();
       res.json({ items: attachDoctorReviewStats(items, summary) });
     } catch (err) {
@@ -1657,9 +2312,40 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
         link: '/orders'
       });
       
-      // Notify pharmacy owners about new order
-      // (In a real system, you'd identify which pharmacy should fulfill this)
-      // For now, we'll create a notification that pharmacy role users can see
+      // Notify all pharmacy owners about the new order
+      try {
+        const pharmacistRows = await query(
+          "SELECT id FROM users WHERE role = 'pharmacist'",
+          []
+        );
+        // Fetch customer name from profile or users table
+        let customerName = 'A customer';
+        try {
+          const profileRows = await query(
+            "SELECT data FROM app_entities WHERE type = 'user_profile' AND user_id = ? LIMIT 1",
+            [req.user.sub]
+          );
+          if (profileRows.length > 0) {
+            const profile = JSON.parse(profileRows[0].data);
+            customerName = profile.name || profile.username || customerName;
+          } else {
+            const emailRows = await query('SELECT email FROM users WHERE id = ? LIMIT 1', [req.user.sub]);
+            if (emailRows.length > 0) customerName = emailRows[0].email || customerName;
+          }
+        } catch (_) {}
+        for (const row of pharmacistRows) {
+          await createNotification(row.id, {
+            type: 'NEW_ORDER',
+            entityId: order.id,
+            title: 'New Order Received',
+            message: `${customerName} placed order #${order.id.slice(0, 8)} — BDT ${computedTotal}`,
+            link: '/dashboard?tab=orders'
+          });
+        }
+      } catch (notifErr) {
+        // Don't fail the order if pharmacy notification fails
+        console.error('Failed to notify pharmacists:', notifErr);
+      }
       
       res.status(201).json({ order });
     } catch (err) {
@@ -1670,8 +2356,10 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
   // Get user's orders
   router.get('/orders', requireAuth, async (req, res, next) => {
     try {
-      const orders = await listEntities({ type: 'order', userId: req.user.sub });
-      res.json({ items: orders });
+      const allOrders = await listEntities({ type: 'order', userId: req.user.sub });
+      const { page, pageSize, offset } = parsePagination(req, { defaultPageSize: 20 });
+      const items = allOrders.slice(offset, offset + pageSize);
+      sendSuccess(res, items, 200, paginationMeta(allOrders.length, page, pageSize));
     } catch (err) {
       next(err);
     }
@@ -1734,114 +2422,38 @@ export function createAppRouter({ requireAuth, requireRole, requireConsentForPat
     }
   });
 
-  // AI Assistant Endpoint - Safe Wellness Questions Only
+  // AI Assistant Endpoint - Orchestrated Multi-Model Routing
   router.post('/ai/chat', requireAuth, async (req, res, next) => {
     try {
-      const { message, locale = 'en' } = req.body;
-      
-      if (!message || !message.trim()) {
-        return res.status(400).json({ error: 'Message is required' });
-      }
-
-      // Safety Filter: Block only critical medical questions (allow general wellness)
-      const sensitiveKeywords = [
-        'bleeding', 'severe pain', 'fever', 'infection', 'emergency',
-        'medication', 'medicine', 'drug', 'tablet', 'prescription', 'antibiotic',
-        'diagnose', 'diagnosis', 'treatment', 'surgery',
-        'abort', 'miscarriage', 'ectopic', 'preeclampsia'
-      ];
-
-      const msgLower = message.toLowerCase();
-      const isSensitive = sensitiveKeywords.some(keyword => msgLower.includes(keyword));
-
-      if (isSensitive) {
-        return res.json({
-          text: locale === 'bn' 
-            ? 'এটি একটি চিকিৎসা প্রশ্ন। আপনার ডাক্তার বা স্বাস্থ্যসেবা প্রদানকারীর সাথে যোগাযোগ করুন।'
-            : 'This is a medical question. Please consult your doctor or healthcare provider.',
-          sources: []
-        });
-      }
-
-      // Try Gemma via Ollama (local model) if available
-      try {
-        const ollamaResponse = await fetch('http://localhost:11434/api/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'gemma:2b',
-            prompt: `You are a helpful pregnancy wellness assistant. Answer this general wellness question in ${locale === 'bn' ? 'Bengali' : 'English'}. Keep response under 80 words.
-
-Question: ${message}
-
-Answer:`,
-            stream: false
-          })
-        });
-
-        if (ollamaResponse.ok) {
-          const data = await ollamaResponse.json();
-          return res.json({
-            text: data.response || "I'm here to help with general wellness questions.",
-            sources: []
-          });
-        }
-      } catch (err) {
-        // Gemma not running, use fallback
-      }
-
-      // Fallback responses for common questions (no API needed)
-      const fallbacks = {
-        'nutrition': locale === 'bn' 
-          ? 'প্রসবপূর্ব পুষ্টি খুবই গুরুত্বপূর্ণ। ফল, সবজি, প্রোটিন এবং দুগ্ধজাত পণ্য অন্তর্ভুক্ত করুন। বিস্তারিত পরিকল্পনার জন্য আপনার ডাক্তারের সাথে কথা বলুন।'
-          : 'Prenatal nutrition is essential. Include fruits, vegetables, proteins, and dairy. Consult your doctor for a personalized plan.',
-        'exercise': locale === 'bn'
-          ? 'গর্ভাবস্থায় হালকা ব্যায়াম যেমন হাঁটা খুবই উপকারী। নতুন ব্যায়াম শুরু করার আগে আপনার ডাক্তারের সাথে কথা বলুন।'
-          : 'Light exercise like walking is beneficial during pregnancy. Always consult your doctor before starting new activities.',
-        'sleep': locale === 'bn'
-          ? 'গর্ভাবস্থায় প্রতিদিন ৭-৯ ঘণ্টা ঘুম লক্ষ্য করুন। পাশে শোয়া আরামদায়ক হতে পারে।'
-          : 'Aim for 7-9 hours of sleep daily during pregnancy. Sleeping on your side can be more comfortable.',
-        'default': locale === 'bn'
-          ? 'আপনার সাধারণ সুস্থতার প্রশ্নে সহায়তা করতে আমি এখানে আছি। চিকিৎসা সংক্রান্ত পরামর্শের জন্য দয়া করে আপনার ডাক্তারের সাথে যোগাযোগ করুন।'
-          : 'I\'m here to help with general wellness questions. For medical advice, please consult your healthcare provider.'
-      };
-
-      let response = fallbacks.default;
-      if (msgLower.includes('food') || msgLower.includes('eat') || msgLower.includes('nutrition')) {
-        response = fallbacks.nutrition;
-      } else if (msgLower.includes('exercise') || msgLower.includes('walk') || msgLower.includes('activity')) {
-        response = fallbacks.exercise;
-      } else if (msgLower.includes('sleep') || msgLower.includes('rest')) {
-        response = fallbacks.sleep;
-      }
-
-      res.json({ text: response, sources: [] });
+      const { message, locale = 'en', includeContext = false } = req.body || {};
+      const result = await handleAiChat({
+        message,
+        locale,
+        userId: req.user.sub,
+        includeContext
+      });
+      res.json(result);
     } catch (error) {
-      console.error('AI Chat Error:', error);
-      res.status(500).json({ error: 'Failed to process request' });
+      next(error);
     }
   });
 
-  // Health Insights Endpoint - No API Key Needed
+  // Health Insights Endpoint - SQL Query from health_insights table
   router.post('/ai/insights', requireAuth, async (req, res, next) => {
     try {
       const { pregnancyWeek, vaccinesDue, hydrationLevel, locale = 'en' } = req.body;
 
-      // Pre-built wellness tips (no external API needed)
-      const insights = {
-        'bn': [
-          'প্রতিদিন কমপক্ষে ৮-১০ গ্লাস জল পান করুন মা।',
-          'আপনার প্রসবপূর্ব ভিটামিন নিতে ভুলবেন না।',
-          'প্রতিদিন হালকা হাঁটাহাঁটি করুন।'
-        ],
-        'en': [
-          'Drink 8-10 glasses of water daily to stay hydrated.',
-          'Don\'t forget to take your prenatal vitamins.',
-          'Light daily walking is great for your health.'
-        ]
-      };
+      // SQL: Fetch wellness tips from health_insights table filtered by locale
+      const insightRows = await query(
+        'SELECT tip_text FROM health_insights WHERE locale = ? AND is_active = TRUE ORDER BY RAND() LIMIT 3',
+        [locale === 'bn' ? 'bn' : 'en']
+      );
+      const tips = insightRows.map(row => row.tip_text);
+      if (tips.length === 0) {
+        tips.push('Stay hydrated.', 'Keep tracking your health.', 'Consult your doctor regularly.');
+      }
 
-      res.json({ insights: insights[locale === 'bn' ? 'bn' : 'en'] });
+      res.json({ insights: tips });
     } catch (error) {
       console.error('Health Insights Error:', error);
       res.status(500).json({ 
@@ -1854,7 +2466,7 @@ Answer:`,
     }
   });
 
-  // Myth Checker Endpoint - Curated Safe Responses
+  // Myth Checker Endpoint - SQL Query from pregnancy_myths table
   router.post('/ai/check-myth', requireAuth, async (req, res, next) => {
     try {
       const { statement, locale = 'en' } = req.body;
@@ -1863,31 +2475,25 @@ Answer:`,
         return res.status(400).json({ error: 'Statement is required' });
       }
 
-      // Curated myth database (manually verified)
-      const mythDb = {
-        'en': [
-          { myth: 'spicy food causes miscarriage', status: 'Myth', explanation: 'Spicy foods are safe during pregnancy. However, if they cause digestive discomfort, avoid them for comfort.' },
-          { myth: 'pregnant women cannot exercise', status: 'Myth', explanation: 'Light exercise is beneficial. Walking, swimming, and prenatal yoga are safe. Always consult your doctor.' },
-          { myth: 'you need to eat for two', status: 'Myth', explanation: 'You need extra calories, but not "eating for two". Extra 300-500 calories per day is typical. Eat healthy foods.' },
-          { myth: 'caffeine causes birth defects', status: 'Myth', explanation: 'Moderate caffeine (under 200mg/day) is generally considered safe. Consult your doctor about your intake.' },
-          { myth: 'heartburn means baby has lots of hair', status: 'Myth', explanation: 'No scientific evidence supports this. Heartburn is common due to hormonal and digestive changes.' }
-        ],
-        'bn': [
-          { myth: 'গরম খাবার গর্ভপাত করায়', status: 'Myth', explanation: 'গরম খাবার নিরাপদ। তবে হজমের সমস্যা হলে এড়িয়ে চলুন।' },
-          { myth: 'গর্ভবতী নারীরা ব্যায়াম করতে পারেন না', status: 'Myth', explanation: 'হালকা ব্যায়াম উপকারী। আপনার ডাক্তারের সাথে পরামর্শ করুন।' },
-          { myth: 'দুই জনের জন্য খেতে হয়', status: 'Myth', explanation: 'অতিরিক্ত ৩০০-৫০০ ক্যালরি প্রয়োজন, দুটি খাবার নয়।' },
-          { myth: 'দুধ পানের নিয়ম পরিবর্তন করতে হয়', status: 'Myth', explanation: 'দুধ এবং দুগ্ধজাত পণ্য গর্ভাবস্থায় নিরাপদ এবং ভালো।' },
-          { myth: 'রাত জাগা শিশুকে প্রভাবিত করে', status: 'Myth', explanation: 'মাঝে মধ্যে রাত জাগা সমস্যা নয়। যথেষ্ট ঘুম গুরুত্বপূর্ণ।' }
-        ]
-      };
+      // SQL: Fetch all myths from pregnancy_myths table filtered by locale
+      const mythRows = await query(
+        'SELECT myth_keyword, claim, verdict, explanation, safe_advice, when_to_call_doctor, sources_label FROM pregnancy_myths WHERE locale = ? AND is_active = TRUE',
+        [locale === 'bn' ? 'bn' : 'en']
+      );
 
-      const statements = mythDb[locale === 'bn' ? 'bn' : 'en'];
       const statementLower = statement.toLowerCase();
 
-      // Search for matching myth
-      for (let m of statements) {
-        if (statementLower.includes(m.myth.toLowerCase())) {
-          return res.json({ status: m.status, explanation: m.explanation });
+      // Search for matching myth using keyword from database
+      for (let m of mythRows) {
+        if (statementLower.includes(m.myth_keyword.toLowerCase())) {
+          return res.json({
+            status: m.verdict || 'Myth',
+            explanation: m.explanation,
+            claim: m.claim,
+            safeAdvice: m.safe_advice,
+            whenToCallDoctor: m.when_to_call_doctor,
+            sourcesLabel: m.sources_label
+          });
         }
       }
 
@@ -1895,7 +2501,7 @@ Answer:`,
       res.json({
         status: 'Unknown',
         explanation: locale === 'bn'
-          ? 'এই বিষয়ে নিশ্চিত নই। আপনার ডাক্তারের সাথে পরামর্শ করুন।'
+          ? 'à¦à¦‡ à¦¬à¦¿à¦·à¦¯à¦¼à§‡ à¦¨à¦¿à¦¶à§à¦šà¦¿à¦¤ à¦¨à¦‡à¥¤ à¦†à¦ªà¦¨à¦¾à¦° à¦¡à¦¾à¦•à§à¦¤à¦¾à¦°à§‡à¦° à¦¸à¦¾à¦¥à§‡ à¦ªà¦°à¦¾à¦®à¦°à§à¦¶ à¦•à¦°à§à¦¨à¥¤'
           : 'I\'m not certain about this. Please consult your healthcare provider.'
       });
     } catch (error) {
@@ -1908,21 +2514,140 @@ Answer:`,
   });
 
   // =====================================================
+  // DBMS SQL ENDPOINTS - Replacing Frontend Hardcoded Data
+  // =====================================================
+
+  // SQL: Fetch vaccine catalog from vaccine_catalog table
+  router.get('/catalog/vaccines-list', async (req, res, next) => {
+    try {
+      const rows = await query(
+        'SELECT id, vaccine_name, description, recommended_week_start, recommended_week_end, is_required FROM vaccine_catalog WHERE is_active = TRUE ORDER BY recommended_week_start ASC'
+      );
+      res.json({ items: rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // SQL: Fetch vaccine suggestions grouped by week range from vaccine_suggestions table
+  router.get('/vaccine-suggestions', async (req, res, next) => {
+    try {
+      const rows = await query(
+        'SELECT id, week_start, week_end, vaccine_names, description FROM vaccine_suggestions WHERE is_active = TRUE ORDER BY week_start ASC'
+      );
+      // Parse vaccine_names JSON string into array
+      const suggestions = rows.map(r => ({
+        ...r,
+        vaccine_names: JSON.parse(r.vaccine_names || '[]')
+      }));
+      res.json({ items: suggestions });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // SQL: Fetch subscription plans from subscription_plans table
+  router.get('/subscription-plans', async (req, res, next) => {
+    try {
+      const rows = await query(
+        'SELECT id, plan_name, price, currency, billing_cycle, features, is_popular, badge_text FROM subscription_plans WHERE is_active = TRUE ORDER BY price ASC'
+      );
+      // Parse features JSON string into array
+      const plans = rows.map(r => ({
+        ...r,
+        features: JSON.parse(r.features || '[]')
+      }));
+      res.json({ items: plans });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // SQL: Fetch FAQs from faqs table
+  router.get('/faqs', async (req, res, next) => {
+    try {
+      const { category } = req.query;
+      let sql = 'SELECT id, question, answer, category FROM faqs WHERE is_active = TRUE';
+      const params = [];
+      if (category) {
+        sql += ' AND category = ?';
+        params.push(category);
+      }
+      sql += ' ORDER BY sort_order ASC';
+      const rows = await query(sql, params);
+      res.json({ items: rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // SQL: Fetch nutrition goals from nutrition_goals table
+  router.get('/nutrition/goals', requireAuth, async (req, res, next) => {
+    try {
+      const userId = req.user.sub;
+      // Try user-specific goals first, fall back to defaults
+      let rows = await query(
+        'SELECT id, calorie_goal, protein_goal_g, carbs_goal_g, fat_goal_g, water_glasses, trimester FROM nutrition_goals WHERE user_id = ? AND is_active = TRUE ORDER BY created_at DESC LIMIT 1',
+        [userId]
+      );
+      if (rows.length === 0) {
+        rows = await query(
+          'SELECT id, calorie_goal, protein_goal_g, carbs_goal_g, fat_goal_g, water_glasses, trimester FROM nutrition_goals WHERE user_id IS NULL AND is_active = TRUE ORDER BY trimester ASC'
+        );
+      }
+      res.json({ goals: rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // SQL: Fetch pregnancy week info from pregnancy_week_info table
+  router.get('/pregnancy/week-info', requireAuth, async (req, res, next) => {
+    try {
+      const { week } = req.query;
+      let sql = 'SELECT id, week_number, trimester, stage_name, baby_size, nutrients, symptoms, tips FROM pregnancy_week_info WHERE is_active = TRUE';
+      const params = [];
+      if (week) {
+        sql += ' AND week_number = ?';
+        params.push(parseInt(week));
+      }
+      sql += ' ORDER BY week_number ASC';
+      const rows = await query(sql, params);
+      // Parse JSON fields
+      const data = rows.map(r => ({
+        ...r,
+        nutrients: JSON.parse(r.nutrients || '[]'),
+        symptoms: JSON.parse(r.symptoms || '[]'),
+        tips: JSON.parse(r.tips || '[]')
+      }));
+      res.json({ items: data });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // =====================================================
   // DOCTOR DASHBOARD ROUTES
   // =====================================================
 
   // Get doctor dashboard overview
   router.get('/doctor/dashboard', requireAuth, requireRole('doctor'), async (req, res, next) => {
     try {
-      const doctorId = req.user.sub;
+      const userId = req.user.sub;
+
+      // Resolve the doctor catalog entry by user_id
+      const doctorCatalogRows = await query(
+        `SELECT id FROM doctors WHERE user_id = ? LIMIT 1`, [userId]
+      );
+      const doctorCatalogId = doctorCatalogRows.length ? doctorCatalogRows[0].id : userId;
 
       const [profileRows, userRows, userProfileRows, doctorRows] = await Promise.all([
-        query(`SELECT data FROM app_entities WHERE type = 'user_profile' AND user_id = ? LIMIT 1`, [doctorId]),
-        query(`SELECT phone, email FROM users WHERE id = ? LIMIT 1`, [doctorId]),
-        query(`SELECT full_name, date_of_birth FROM user_profiles WHERE user_id = ? LIMIT 1`, [doctorId]),
+        query(`SELECT data FROM app_entities WHERE type = 'user_profile' AND user_id = ? LIMIT 1`, [userId]),
+        query(`SELECT phone, email FROM users WHERE id = ? LIMIT 1`, [userId]),
+        query(`SELECT full_name, date_of_birth FROM user_profiles WHERE user_id = ? LIMIT 1`, [userId]),
         query(
-          `SELECT full_name, specialty_id, phone, email, fee_amount, verified, rating FROM doctors WHERE id = ? LIMIT 1`,
-          [doctorId]
+          `SELECT full_name, specialty_id, phone, email, fee_amount, verified, rating FROM doctors WHERE user_id = ? LIMIT 1`,
+          [userId]
         )
       ]);
 
@@ -1957,7 +2682,8 @@ Answer:`,
           : null;
 
       const profile = {
-        id: doctorId,
+        id: userId,
+        catalogId: doctorCatalogId,
         name:
           doctorRow.full_name ||
           userProfile.full_name ||
@@ -1992,7 +2718,7 @@ Answer:`,
           createdAt: row.created_at,
           userId: row.user_id || parseJson(row.data, {}).userId
         }))
-        .filter((appt) => appt && appt.doctorId === doctorId);
+        .filter((appt) => appt && appt.doctorId === doctorCatalogId);
 
       const patientIds = appointments
         .map((appt) => appt.patientId || appt.userId)
@@ -2113,7 +2839,7 @@ Answer:`,
 
       const scheduleRows = await query(
         `SELECT data FROM app_entities WHERE type = 'doctor_schedule' AND user_id = ? LIMIT 1`,
-        [doctorId]
+        [userId]
       );
 
       let schedule = [];
@@ -2124,7 +2850,7 @@ Answer:`,
 
       const notificationRows = await query(
         `SELECT id, data, created_at FROM app_entities WHERE type = 'notification' AND user_id = ? ORDER BY created_at DESC LIMIT 10`,
-        [doctorId]
+        [userId]
       );
       const notifications = notificationRows.map((row) => {
         const data = parseJson(row.data, {});
@@ -2157,11 +2883,13 @@ Answer:`,
   router.get('/doctor/consultations', requireAuth, requireRole('doctor'), async (req, res, next) => {
     try {
       const { status, page = 1, limit = 10 } = req.query;
-      const doctorId = req.user.sub;
+      const userId = req.user.sub;
+      const docCatRows = await query('SELECT id FROM doctors WHERE user_id = ? LIMIT 1', [userId]);
+      const doctorCatalogId = docCatRows.length ? docCatRows[0].id : userId;
 
       const doctorFeeRows = await query(
-        `SELECT fee_amount FROM doctors WHERE id = ? LIMIT 1`,
-        [doctorId]
+        `SELECT fee_amount FROM doctors WHERE user_id = ? LIMIT 1`,
+        [userId]
       );
       const doctorFeeValue =
         doctorFeeRows.length > 0 && doctorFeeRows[0].fee_amount !== null && doctorFeeRows[0].fee_amount !== ''
@@ -2180,7 +2908,7 @@ Answer:`,
           createdAt: row.created_at,
           userId: row.user_id || parseJson(row.data, {}).userId
         }))
-        .filter((appt) => appt && appt.doctorId === doctorId);
+        .filter((appt) => appt && appt.doctorId === doctorCatalogId);
 
       const patientIds = appointments
         .map((appt) => appt.patientId || appt.userId)
@@ -2212,7 +2940,7 @@ Answer:`,
   });
 
   // Get patient details
-  // 🔐 PATIENT DETAILS - REQUIRES CONSENT (DATABASE-BACKED)
+  // ðŸ” PATIENT DETAILS - REQUIRES CONSENT (DATABASE-BACKED)
   router.get('/doctor/patients/:id', requireAuth, requireRole('doctor'), requireConsentForPatient('id'), async (req, res, next) => {
     try {
       const patientId = req.params.id;
@@ -2324,7 +3052,7 @@ Answer:`,
     }
   });
 
-  // 🔐 UPDATE APPOINTMENT - VERIFY DOCTOR-PATIENT RELATIONSHIP
+  // ðŸ” UPDATE APPOINTMENT - VERIFY DOCTOR-PATIENT RELATIONSHIP
   router.patch('/doctor/appointments/:id', requireAuth, requireRole('doctor'), async (req, res, next) => {
     try {
       const appointmentId = req.params.id;
@@ -2352,35 +3080,37 @@ Answer:`,
         return res.status(403).json({ error: 'Not authorized to update this appointment' });
       }
 
-      // 🔐 Verify consent exists (time-sensitive for active consultations)
-      const consentRows = await query(
-        `SELECT id, data FROM app_entities 
-         WHERE type = 'medical_consent' 
-         AND user_id = ?
-         LIMIT 100`,
-        [patientId]
-      );
+      const requiresConsent = normalizedStatus === 'in-progress' || normalizedStatus === 'completed';
+      if (requiresConsent) {
+        // Verify consent exists (time-sensitive for active consultations)
+        const consentRows = await query(
+          `SELECT id, data FROM app_entities 
+           WHERE type = 'medical_consent' 
+           AND user_id = ?
+           LIMIT 100`,
+          [patientId]
+        );
 
-      const now = new Date();
-      const activeConsent = consentRows.some(row => {
-        try {
-          const consent = JSON.parse(row.data || '{}');
-          if (consent.doctorId !== req.user.sub) return false;
-          if (consent.status !== 'active') return false;
-          if (consent.expiresAt && now > new Date(consent.expiresAt)) return false;
-          return true;
-        } catch (err) {
-          return false;
-        }
-      });
-
-      if (!activeConsent) {
-        return res.status(403).json({
-          error: 'Access denied: Patient consent required',
-          reason: 'no_active_consent'
+        const now = new Date();
+        const activeConsent = consentRows.some(row => {
+          try {
+            const consent = JSON.parse(row.data || '{}');
+            if (consent.doctorId !== req.user.sub) return false;
+            if (consent.status !== 'active') return false;
+            if (consent.expiresAt && now > new Date(consent.expiresAt)) return false;
+            return true;
+          } catch (err) {
+            return false;
+          }
         });
+
+        if (!activeConsent) {
+          return res.status(403).json({
+            error: 'Access denied: Patient consent required',
+            reason: 'no_active_consent'
+          });
+        }
       }
-      
       // Update appointment
       appointment.status = normalizedStatus;
       if (notes) appointment.doctorNotes = notes;
@@ -2415,32 +3145,98 @@ Answer:`,
     }
   });
 
-  // 🔐 CREATE PRESCRIPTION - REQUIRES PATIENT CONSENT
+  // ðŸ” CREATE PRESCRIPTION - REQUIRES PATIENT CONSENT
   router.post('/doctor/prescriptions', requireAuth, requireRole('doctor'), requireConsentForPatient('patientId'), async (req, res, next) => {
     try {
-      const { consultationId, patientId, medications, instructions, followUpDate, locale } = req.body;
+      const { consultationId, patientId, medications, instructions, followUpDate, locale, diagnosis } = req.body;
+      const safePatientId = toTrimmedString(patientId, 100);
+      const safeConsultationId = toTrimmedString(consultationId, 100) || null;
 
-      if (!consultationId || !patientId || !medications || !Array.isArray(medications)) {
-        return res.status(400).json({ error: 'Missing required fields' });
+      const safeMedications = Array.isArray(medications)
+        ? medications
+            .filter((item) => isPlainObject(item) && toTrimmedString(item.name, 200))
+            .map((item) => ({
+              name: toTrimmedString(item.name, 200),
+              dosage: toOptionalString(item.dosage, 200),
+              frequency: toOptionalString(item.frequency, 200),
+              duration: toOptionalString(item.duration, 200),
+              instructions: toOptionalString(item.instructions, 1000)
+            }))
+        : [];
+
+      if (!safePatientId || safeMedications.length === 0) {
+        return res.status(400).json({ error: 'patientId and at least one medication are required' });
+      }
+      if (followUpDate && !isValidDateValue(followUpDate)) {
+        return res.status(400).json({ error: 'Invalid followUpDate' });
       }
 
-      const prescription = {
-        id: uuidv4(),
-        consultationId,
-        patientId,
-        doctorId: req.user.sub,
-        medications,
-        instructions: instructions || '',
-        followUpDate: followUpDate || null,
-        createdAt: new Date().toISOString(),
-        locale: locale || 'en',
-        status: 'active'
-      };
+      const prescription = await createEntity({
+        type: 'prescription',
+        userId: safePatientId,
+        data: {
+          doctorId: req.user.sub,
+          patientId: safePatientId,
+          consultationId: safeConsultationId,
+          medications: safeMedications,
+          instructions: toTrimmedString(instructions, 5000),
+          diagnosis: toOptionalString(diagnosis, 5000),
+          followUpDate: followUpDate || null,
+          locale: toOptionalString(locale, 20) || 'en',
+          status: 'active'
+        }
+      });
 
-      // In real implementation, save to database
-      // await createEntity({ type: 'prescription', userId: patientId, data: prescription });
+      // Link appointment with this prescription when a consultation ID is provided.
+      if (safeConsultationId) {
+        const consultationRows = await query(
+          `SELECT id, data FROM app_entities WHERE id = ? AND type = 'appointment' LIMIT 1`,
+          [safeConsultationId]
+        );
+
+        if (consultationRows.length > 0) {
+          const consultation = parseJson(consultationRows[0].data, {});
+          consultation.prescriptionId = prescription.id;
+          consultation.hasPrescription = true;
+          consultation.updatedAt = new Date().toISOString();
+
+          await query(
+            `UPDATE app_entities SET data = ?, updated_at = NOW() WHERE id = ?`,
+            [JSON.stringify(consultation), safeConsultationId]
+          );
+        }
+      }
+
+      await createNotification(safePatientId, {
+        type: 'PRESCRIPTION_CREATED',
+        entityId: prescription.id,
+        title: 'New Prescription',
+        message: 'Your doctor has created a new prescription for you.',
+        link: '/health'
+      });
 
       res.status(201).json(prescription);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Update doctor consultation fee
+  router.put('/doctor/fee', requireAuth, requireRole('doctor'), async (req, res, next) => {
+    try {
+      const userId = req.user.sub;
+      const { fee } = req.body;
+      const feeNum = Number(fee);
+      if (!Number.isFinite(feeNum) || feeNum < 0) {
+        return res.status(400).json({ error: 'Invalid fee amount' });
+      }
+      // Find doctor catalog entry by user_id
+      const docRows = await query('SELECT id FROM doctors WHERE user_id = ? LIMIT 1', [userId]);
+      if (!docRows.length) {
+        return res.status(404).json({ error: 'Doctor profile not found' });
+      }
+      await query('UPDATE doctors SET fee_amount = ?, updated_at = NOW() WHERE user_id = ?', [feeNum, userId]);
+      res.json({ success: true, fee: feeNum });
     } catch (err) {
       next(err);
     }
@@ -2518,11 +3314,13 @@ Answer:`,
   // Get doctor earnings (CALCULATED FROM REAL DATA)
   router.get('/doctor/earnings', requireAuth, requireRole('doctor'), async (req, res, next) => {
     try {
-      const doctorId = req.user.sub;
+      const userId = req.user.sub;
+      const docCatRows2 = await query('SELECT id FROM doctors WHERE user_id = ? LIMIT 1', [userId]);
+      const doctorCatalogId = docCatRows2.length ? docCatRows2[0].id : userId;
 
       const doctorRows = await query(
-        `SELECT fee_amount FROM doctors WHERE id = ? LIMIT 1`,
-        [doctorId]
+        `SELECT fee_amount FROM doctors WHERE user_id = ? LIMIT 1`,
+        [userId]
       );
       const doctorFeeValue =
         doctorRows.length > 0 && doctorRows[0].fee_amount !== null && doctorRows[0].fee_amount !== ''
@@ -2541,7 +3339,7 @@ Answer:`,
           createdAt: row.created_at,
           userId: row.user_id || parseJson(row.data, {}).userId
         }))
-        .filter((appt) => appt && appt.doctorId === doctorId);
+        .filter((appt) => appt && appt.doctorId === doctorCatalogId);
 
       const consultations = appointments.map((appt) =>
         buildConsultationFromAppointment(appt, new Map(), defaultFee)
@@ -2868,6 +3666,239 @@ Answer:`,
       }
       
       res.json({ order });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // =====================================================
+  // MERCHANDISER DASHBOARD ROUTES
+  // =====================================================
+
+  router.get('/merchandiser/dashboard', requireAuth, requireRole('merchandiser'), async (req, res, next) => {
+    try {
+      const [products, notifications] = await Promise.all([
+        listEntities({ type: 'merchant_product', userId: req.user.sub }),
+        listEntities({ type: 'notification', userId: req.user.sub })
+      ]);
+
+      const safeProducts = (products || []).map((item) => ({
+        id: item.id,
+        name: toTrimmedString(item.name, 200),
+        category: toTrimmedString(item.category, 100) || 'General',
+        price: toNonNegativeNumber(item.price) ?? 0,
+        stockQuantity: Math.max(0, Math.round(toNonNegativeNumber(item.stockQuantity) ?? 0)),
+        lowStockThreshold: Math.max(0, Math.round(toNonNegativeNumber(item.lowStockThreshold) ?? 10)),
+        status: normalizeEnumValue(item.status || 'draft', allowedMerchandiserProductStatuses) || 'draft',
+        image: toOptionalString(item.image, 1000) || null,
+        description: toOptionalString(item.description, 5000) || '',
+        createdAt: item.createdAt || null,
+        updatedAt: item.updatedAt || null
+      }));
+
+      const totalProducts = safeProducts.length;
+      const activeProducts = safeProducts.filter((item) => item.status === 'active').length;
+      const lowStockProducts = safeProducts.filter(
+        (item) => item.stockQuantity > 0 && item.stockQuantity <= item.lowStockThreshold
+      ).length;
+      const outOfStockProducts = safeProducts.filter((item) => item.stockQuantity === 0).length;
+      const inventoryValue = safeProducts.reduce(
+        (sum, item) => sum + item.price * item.stockQuantity,
+        0
+      );
+
+      const unreadNotifications = (notifications || []).filter((item) => !item.isRead).length;
+
+      res.json({
+        profile: {
+          id: req.user.sub,
+          name: req.user?.name || req.user?.email || 'Merchandiser',
+          email: req.user?.email || null,
+          phone: req.user?.phone || null,
+          avatar: req.user?.avatar || null
+        },
+        stats: {
+          totalProducts,
+          activeProducts,
+          lowStockProducts,
+          outOfStockProducts,
+          inventoryValue,
+          unreadNotifications
+        },
+        recentProducts: safeProducts
+          .slice()
+          .sort((a, b) => {
+            const aTime = new Date(a.updatedAt || a.createdAt || 0).getTime() || 0;
+            const bTime = new Date(b.updatedAt || b.createdAt || 0).getTime() || 0;
+            return bTime - aTime;
+          })
+          .slice(0, 5)
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get('/merchandiser/products', requireAuth, requireRole('merchandiser'), async (req, res, next) => {
+    try {
+      const statusFilter = toTrimmedString(req.query.status, 50).toLowerCase();
+      const items = await listEntities({ type: 'merchant_product', userId: req.user.sub });
+
+      const products = (items || [])
+        .map((item) => ({
+          id: item.id,
+          name: toTrimmedString(item.name, 200),
+          category: toTrimmedString(item.category, 100) || 'General',
+          price: toNonNegativeNumber(item.price) ?? 0,
+          stockQuantity: Math.max(0, Math.round(toNonNegativeNumber(item.stockQuantity) ?? 0)),
+          lowStockThreshold: Math.max(0, Math.round(toNonNegativeNumber(item.lowStockThreshold) ?? 10)),
+          status: normalizeEnumValue(item.status || 'draft', allowedMerchandiserProductStatuses) || 'draft',
+          image: toOptionalString(item.image, 1000) || null,
+          description: toOptionalString(item.description, 5000) || '',
+          createdAt: item.createdAt || null,
+          updatedAt: item.updatedAt || null
+        }))
+        .filter((item) => (statusFilter && statusFilter !== 'all' ? item.status === statusFilter : true))
+        .sort((a, b) => {
+          const aTime = new Date(a.updatedAt || a.createdAt || 0).getTime() || 0;
+          const bTime = new Date(b.updatedAt || b.createdAt || 0).getTime() || 0;
+          return bTime - aTime;
+        });
+
+      res.json({ items: products });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/merchandiser/products', requireAuth, requireRole('merchandiser'), async (req, res, next) => {
+    try {
+      const {
+        name,
+        category,
+        price,
+        stockQuantity,
+        lowStockThreshold,
+        status,
+        image,
+        description
+      } = req.body || {};
+
+      const safeName = toTrimmedString(name, 200);
+      const safeCategory = toTrimmedString(category, 100) || 'General';
+      const safePrice = toNonNegativeNumber(price);
+      const safeStockQuantity = toNonNegativeNumber(stockQuantity);
+      const safeLowStockThreshold = toNonNegativeNumber(lowStockThreshold);
+      const safeStatus =
+        normalizeEnumValue(status || 'draft', allowedMerchandiserProductStatuses) || 'draft';
+
+      if (!safeName) {
+        return res.status(400).json({ error: 'name is required' });
+      }
+      if (safePrice === null) {
+        return res.status(400).json({ error: 'Valid price is required' });
+      }
+
+      const item = await createEntity({
+        type: 'merchant_product',
+        userId: req.user.sub,
+        data: {
+          name: safeName,
+          category: safeCategory,
+          price: safePrice,
+          stockQuantity: Math.max(0, Math.round(safeStockQuantity ?? 0)),
+          lowStockThreshold: Math.max(0, Math.round(safeLowStockThreshold ?? 10)),
+          status: safeStatus,
+          image: toOptionalString(image, 1000) || null,
+          description: toOptionalString(description, 5000) || ''
+        }
+      });
+
+      res.status(201).json({ item });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.patch('/merchandiser/products/:id', requireAuth, requireRole('merchandiser'), async (req, res, next) => {
+    try {
+      const existing = await getEntity({
+        id: req.params.id,
+        type: 'merchant_product',
+        userId: req.user.sub
+      });
+      if (!existing) {
+        return res.status(404).json({ error: 'Product not found' });
+      }
+
+      const updates = {};
+      if (req.body?.name !== undefined) {
+        const safeName = toTrimmedString(req.body.name, 200);
+        if (!safeName) return res.status(400).json({ error: 'Invalid name' });
+        updates.name = safeName;
+      }
+      if (req.body?.category !== undefined) {
+        updates.category = toTrimmedString(req.body.category, 100) || 'General';
+      }
+      if (req.body?.price !== undefined) {
+        const safePrice = toNonNegativeNumber(req.body.price);
+        if (safePrice === null) return res.status(400).json({ error: 'Invalid price' });
+        updates.price = safePrice;
+      }
+      if (req.body?.stockQuantity !== undefined) {
+        const safeStock = toNonNegativeNumber(req.body.stockQuantity);
+        if (safeStock === null) return res.status(400).json({ error: 'Invalid stockQuantity' });
+        updates.stockQuantity = Math.max(0, Math.round(safeStock));
+      }
+      if (req.body?.lowStockThreshold !== undefined) {
+        const safeThreshold = toNonNegativeNumber(req.body.lowStockThreshold);
+        if (safeThreshold === null) {
+          return res.status(400).json({ error: 'Invalid lowStockThreshold' });
+        }
+        updates.lowStockThreshold = Math.max(0, Math.round(safeThreshold));
+      }
+      if (req.body?.status !== undefined) {
+        const safeStatus = normalizeEnumValue(req.body.status, allowedMerchandiserProductStatuses);
+        if (!safeStatus) return res.status(400).json({ error: 'Invalid status' });
+        updates.status = safeStatus;
+      }
+      if (req.body?.image !== undefined) {
+        updates.image = toOptionalString(req.body.image, 1000) || null;
+      }
+      if (req.body?.description !== undefined) {
+        updates.description = toOptionalString(req.body.description, 5000) || '';
+      }
+
+      const item = await updateEntity({
+        id: req.params.id,
+        type: 'merchant_product',
+        userId: req.user.sub,
+        data: updates
+      });
+
+      if (!item) {
+        return res.status(404).json({ error: 'Product not found' });
+      }
+
+      res.json({ item });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.delete('/merchandiser/products/:id', requireAuth, requireRole('merchandiser'), async (req, res, next) => {
+    try {
+      const ok = await deleteEntity({
+        id: req.params.id,
+        type: 'merchant_product',
+        userId: req.user.sub
+      });
+
+      if (!ok) {
+        return res.status(404).json({ error: 'Product not found' });
+      }
+
+      res.json({ ok: true });
     } catch (err) {
       next(err);
     }
@@ -3433,9 +4464,628 @@ Answer:`,
       next(err);
     }
   });
+
+  // =====================================================
+  // PATIENT DASHBOARD SUMMARY (Mother Dashboard)
+  // =====================================================
+
+  // Get aggregated dashboard summary - single API call for all dashboard data
+  router.get('/dashboard/summary', requireAuth, async (req, res, next) => {
+    try {
+      const userId = req.user.sub;
+      const today = new Date().toISOString().split('T')[0];
+
+      // Parallel fetch all data
+      const [
+        metaRows,
+        appointmentRows,
+        vaccineRows,
+        healthHistoryRows
+      ] = await Promise.all([
+        // User meta (hydration, pregnancyWeek)
+        query(
+          `SELECT meta_key, meta_value FROM app_user_meta WHERE user_id = ? AND meta_key IN ('hydration', 'pregnancyWeek')`,
+          [userId]
+        ),
+        // Appointments for this user
+        query(
+          `SELECT id, data, created_at FROM app_entities WHERE type = 'appointment' AND user_id = ? ORDER BY created_at DESC`,
+          [userId]
+        ),
+        // Vaccines for this user
+        query(
+          `SELECT id, data, created_at FROM app_entities WHERE type = 'vaccine' AND user_id = ? ORDER BY created_at DESC`,
+          [userId]
+        ),
+        // Health history entries for this user (last 30 days, key metrics)
+        query(
+          `SELECT id, subtype, data, created_at FROM app_entities 
+           WHERE type = 'health_history' AND user_id = ? 
+           AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+           ORDER BY created_at DESC`,
+          [userId]
+        )
+      ]);
+
+      // Parse user meta
+      const meta = {};
+      metaRows.forEach(row => {
+        meta[row.meta_key] = row.meta_value;
+      });
+      const pregnancyWeek = Number(meta.pregnancyWeek) || 0;
+      const waterToday = Number(meta.hydration) || 0;
+
+      // Parse appointments and count upcoming
+      const nowMs = Date.now();
+      let upcomingAppointments = 0;
+      appointmentRows.forEach(row => {
+        const data = parseJson(row.data, {});
+        const status = String(data.status || '').toLowerCase();
+        // Check if scheduled or upcoming and not cancelled/completed
+        if (status === 'cancelled' || status === 'completed' || status === 'pending' || status === 'requested' || status === 'request') return;
+        
+        // Check scheduledAt or date
+        const scheduledAt = data.scheduledAt || data.date;
+        if (!scheduledAt) return;
+        
+        const scheduledDate = new Date(scheduledAt);
+        if (Number.isFinite(scheduledDate.getTime()) && scheduledDate.getTime() > nowMs) {
+          upcomingAppointments++;
+        }
+      });
+
+      // Parse vaccines and calculate progress
+      let totalVaccines = 0;
+      let completedVaccines = 0;
+      vaccineRows.forEach(row => {
+        const data = parseJson(row.data, {});
+        totalVaccines++;
+        const status = String(data.status || '').toLowerCase();
+        if (status === 'taken' || status === 'completed') {
+          completedVaccines++;
+        }
+      });
+      const vaccineProgress = totalVaccines > 0 
+        ? Math.round((completedVaccines / totalVaccines) * 100) 
+        : 0;
+
+      // Parse health history and get latest values for key metrics
+      const healthMetrics = {};
+      const metricTypes = ['Heart Rate', 'Weight', 'Sleep', 'Blood Pressure', 'Mood', 'Steps'];
+      
+      healthHistoryRows.forEach(row => {
+        const metricType = row.subtype;
+        if (!metricTypes.includes(metricType)) return;
+        if (healthMetrics[metricType]) return; // Already have latest
+        
+        const data = parseJson(row.data, {});
+        healthMetrics[metricType] = {
+          value: data.value || null,
+          date: data.date || row.created_at,
+          unit: getMetricUnit(metricType)
+        };
+      });
+
+      // Build health summary array with only available metrics
+      const healthSummaryMetrics = Object.entries(healthMetrics).map(([type, data]) => ({
+        type,
+        value: data.value,
+        date: data.date,
+        unit: data.unit
+      }));
+
+      res.json({
+        pregnancyWeek,
+        waterToday,
+        vaccineProgress,
+        vaccineCounts: {
+          total: totalVaccines,
+          completed: completedVaccines
+        },
+        upcomingAppointments,
+        healthSummaryMetrics
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // =====================================================
+  // NUTRITIONIST DASHBOARD ROUTES
+  // =====================================================
+
+  // GET /nutritionist/dashboard – overview data
+  router.get('/nutritionist/dashboard', requireAuth, requireRole('nutritionist'), async (req, res, next) => {
+    try {
+      const userId = req.user.sub;
+
+      const [plans, patients, notifications, userRows] = await Promise.all([
+        listEntities({ type: 'nutrition_plan', userId }),
+        listEntities({ type: 'nutrition_patient', userId }),
+        listEntities({ type: 'notification', userId }),
+        query(`SELECT email FROM users WHERE id = ? LIMIT 1`, [userId])
+      ]);
+
+      const safePlans = (plans || []).map(p => ({
+        id: p.id,
+        status: normalizeEnumValue(p.status || 'draft', allowedNutritionPlanStatuses) || 'draft',
+        patientName: toTrimmedString(p.patientName, 200),
+        createdAt: p.createdAt || null,
+        updatedAt: p.updatedAt || null
+      }));
+
+      const totalPlans = safePlans.length;
+      const activePlans = safePlans.filter(p => p.status === 'active').length;
+      const draftPlans = safePlans.filter(p => p.status === 'draft').length;
+      const completedPlans = safePlans.filter(p => p.status === 'completed').length;
+      const totalPatients = (patients || []).length;
+      const activePatients = (patients || []).filter(p => p.status === 'active').length;
+      const unreadNotifications = (notifications || []).filter(n => !n.isRead).length;
+
+      const now = new Date();
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+      const newPatientsThisMonth = (patients || []).filter(p => p.createdAt && p.createdAt >= monthStart).length;
+
+      const completionRate = totalPlans > 0 ? Math.round((completedPlans / totalPlans) * 100) : 0;
+
+      res.json({
+        profile: {
+          id: userId,
+          name: req.user?.name || req.user?.email || 'Nutritionist',
+          email: userRows.length > 0 ? userRows[0].email : (req.user?.email || null),
+          phone: req.user?.phone || null,
+          avatar: req.user?.avatar || null
+        },
+        stats: {
+          totalPatients,
+          newPatientsThisMonth,
+          activePlans,
+          draftPlans,
+          completedPlans,
+          totalPlans,
+          consultationsThisMonth: 0,
+          avgCompletionRate: completionRate,
+          patientSatisfaction: null
+        },
+        recentConsultations: [],
+        upcomingFollowUps: []
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /nutritionist/patients – list patients
+  router.get('/nutritionist/patients', requireAuth, requireRole('nutritionist'), async (req, res, next) => {
+    try {
+      const statusFilter = toTrimmedString(req.query.status, 50).toLowerCase();
+      const items = await listEntities({ type: 'nutrition_patient', userId: req.user.sub });
+
+      const patients = (items || [])
+        .map(p => ({
+          id: p.id,
+          name: toTrimmedString(p.name, 200),
+          email: toOptionalString(p.email, 200) || null,
+          age: toNonNegativeNumber(p.age) ?? null,
+          bmi: toNonNegativeNumber(p.bmi) ?? null,
+          dietaryRestrictions: toOptionalString(p.dietaryRestrictions, 2000) || null,
+          goals: toOptionalString(p.goals, 2000) || null,
+          lastConsultation: p.lastConsultation || null,
+          status: normalizeEnumValue(p.status || 'active', new Set(['active', 'completed', 'inactive'])) || 'active',
+          createdAt: p.createdAt || null
+        }))
+        .filter(p => (statusFilter && statusFilter !== 'all' ? p.status === statusFilter : true));
+
+      res.json({ items: patients });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /nutritionist/plans – list nutrition plans
+  router.get('/nutritionist/plans', requireAuth, requireRole('nutritionist'), async (req, res, next) => {
+    try {
+      const statusFilter = toTrimmedString(req.query.status, 50).toLowerCase();
+      const items = await listEntities({ type: 'nutrition_plan', userId: req.user.sub });
+
+      const plans = (items || [])
+        .map(p => ({
+          id: p.id,
+          patientId: p.patientId || null,
+          patientName: toTrimmedString(p.patientName, 200),
+          title: toTrimmedString(p.title, 200),
+          description: toOptionalString(p.description, 5000) || '',
+          goals: toOptionalString(p.goals, 2000) || '',
+          dietaryRestrictions: toOptionalString(p.dietaryRestrictions, 2000) || '',
+          recommendations: toOptionalString(p.recommendations, 5000) || '',
+          status: normalizeEnumValue(p.status || 'draft', allowedNutritionPlanStatuses) || 'draft',
+          createdAt: p.createdAt || null,
+          updatedAt: p.updatedAt || null
+        }))
+        .filter(p => (statusFilter && statusFilter !== 'all' ? p.status === statusFilter : true))
+        .sort((a, b) => {
+          const aTime = new Date(a.updatedAt || a.createdAt || 0).getTime() || 0;
+          const bTime = new Date(b.updatedAt || b.createdAt || 0).getTime() || 0;
+          return bTime - aTime;
+        });
+
+      res.json({ items: plans });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // POST /nutritionist/plans – create a nutrition plan
+  router.post('/nutritionist/plans', requireAuth, requireRole('nutritionist'), async (req, res, next) => {
+    try {
+      const { patientId, title, description, goals, dietaryRestrictions, status, recommendations } = req.body || {};
+
+      const safeTitle = toTrimmedString(title, 200);
+      if (!safeTitle) {
+        return res.status(400).json({ error: 'title is required' });
+      }
+
+      const safeStatus = normalizeEnumValue(status || 'draft', allowedNutritionPlanStatuses) || 'draft';
+
+      // Resolve patient name if patientId is given
+      let patientName = '';
+      if (patientId) {
+        const patient = await getEntity({ id: patientId, type: 'nutrition_patient', userId: req.user.sub });
+        patientName = patient?.name || '';
+      }
+
+      const item = await createEntity({
+        type: 'nutrition_plan',
+        userId: req.user.sub,
+        data: {
+          patientId: patientId || null,
+          patientName,
+          title: safeTitle,
+          description: toOptionalString(description, 5000) || '',
+          goals: toOptionalString(goals, 2000) || '',
+          dietaryRestrictions: toOptionalString(dietaryRestrictions, 2000) || '',
+          recommendations: toOptionalString(recommendations, 5000) || '',
+          status: safeStatus
+        }
+      });
+
+      res.status(201).json({ item });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // PATCH /nutritionist/plans/:id – update a nutrition plan
+  router.patch('/nutritionist/plans/:id', requireAuth, requireRole('nutritionist'), async (req, res, next) => {
+    try {
+      const existing = await getEntity({ id: req.params.id, type: 'nutrition_plan', userId: req.user.sub });
+      if (!existing) {
+        return res.status(404).json({ error: 'Plan not found' });
+      }
+
+      const updates = {};
+      if (req.body?.title !== undefined) {
+        const safeTitle = toTrimmedString(req.body.title, 200);
+        if (!safeTitle) return res.status(400).json({ error: 'Invalid title' });
+        updates.title = safeTitle;
+      }
+      if (req.body?.description !== undefined) {
+        updates.description = toOptionalString(req.body.description, 5000) || '';
+      }
+      if (req.body?.goals !== undefined) {
+        updates.goals = toOptionalString(req.body.goals, 2000) || '';
+      }
+      if (req.body?.dietaryRestrictions !== undefined) {
+        updates.dietaryRestrictions = toOptionalString(req.body.dietaryRestrictions, 2000) || '';
+      }
+      if (req.body?.recommendations !== undefined) {
+        updates.recommendations = toOptionalString(req.body.recommendations, 5000) || '';
+      }
+      if (req.body?.status !== undefined) {
+        const safeStatus = normalizeEnumValue(req.body.status, allowedNutritionPlanStatuses);
+        if (!safeStatus) return res.status(400).json({ error: 'Invalid status' });
+        updates.status = safeStatus;
+      }
+      if (req.body?.patientId !== undefined) {
+        updates.patientId = req.body.patientId || null;
+        if (updates.patientId) {
+          const patient = await getEntity({ id: updates.patientId, type: 'nutrition_patient', userId: req.user.sub });
+          updates.patientName = patient?.name || '';
+        }
+      }
+
+      const item = await updateEntity({
+        id: req.params.id,
+        type: 'nutrition_plan',
+        userId: req.user.sub,
+        data: updates
+      });
+
+      if (!item) {
+        return res.status(404).json({ error: 'Plan not found' });
+      }
+
+      res.json({ item });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // DELETE /nutritionist/plans/:id – delete a nutrition plan
+  router.delete('/nutritionist/plans/:id', requireAuth, requireRole('nutritionist'), async (req, res, next) => {
+    try {
+      const ok = await deleteEntity({ id: req.params.id, type: 'nutrition_plan', userId: req.user.sub });
+      if (!ok) {
+        return res.status(404).json({ error: 'Plan not found' });
+      }
+      res.json({ success: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // =====================================================
+  // HEALTH-ID VERIFICATION STATUS & HOSPITAL VERIFICATION
+  // =====================================================
+
+  // GET /health-id/verification-status – check current user's health-ID verification status
+  router.get('/health-id/verification-status', requireAuth, async (req, res, next) => {
+    try {
+      const userId = req.user.sub;
+
+      // Check for existing verification entity
+      const verifications = await listEntities({ type: 'health_id_verification', userId });
+      const latest = (verifications || [])
+        .sort((a, b) => new Date(b.requestedAt || b.createdAt || 0).getTime() - new Date(a.requestedAt || a.createdAt || 0).getTime())
+        [0];
+
+      // Get user health_id from users table
+      const userRows = await query(`SELECT health_id FROM users WHERE id = ? LIMIT 1`, [userId]);
+      const healthId = userRows.length > 0 ? userRows[0].health_id : null;
+
+      res.json({
+        success: true,
+        data: {
+          health_id: healthId || '',
+          status: latest ? (latest.status || 'none') : 'none'
+        }
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // POST /health-id/verification-request – submit a verification request
+  router.post('/health-id/verification-request', requireAuth, async (req, res, next) => {
+    try {
+      const { request_note } = req.body || {};
+
+      // Require Marriage Certificate (mandatory). NID is optional.
+      const userDocs = await listEntities({ type: 'verification_doc', userId: req.user.sub });
+      const uploadedDocs = (userDocs || []).filter(d => d.fileUrl && d.type);
+      const hasMarriageCert = uploadedDocs.some(d => d.type === 'MARRIAGE_CERT');
+      if (!hasMarriageCert) {
+        return res.status(400).json({ error: 'You must upload your Marriage Certificate before requesting verification. NID is optional.' });
+      }
+
+      // Check for existing pending request
+      const existingRequests = await listEntities({ type: 'health_id_verification', userId: req.user.sub });
+      const pendingExists = (existingRequests || []).some(r => r.status === 'pending');
+      if (pendingExists) {
+        return res.status(400).json({ error: 'You already have a pending verification request.' });
+      }
+
+      // Collect document references for admin review
+      const docSummary = uploadedDocs.map(d => ({
+        type: d.type || d.subtype,
+        fileName: d.fileName || '',
+        fileUrl: d.fileUrl || '',
+        status: d.status || 'PENDING',
+        uploadedAt: d.uploadedAt || d.createdAt || ''
+      }));
+
+      // Get user info for the notification
+      const userRows = await query(
+        `SELECT u.email, u.health_id, p.full_name FROM users u LEFT JOIN user_profiles p ON p.user_id = u.id WHERE u.id = ? LIMIT 1`,
+        [req.user.sub]
+      );
+      const userName = userRows.length > 0 ? (userRows[0].full_name || userRows[0].email || 'A user') : 'A user';
+      const healthId = userRows.length > 0 ? (userRows[0].health_id || '') : '';
+
+      const verification = await createEntity({
+        type: 'health_id_verification',
+        userId: req.user.sub,
+        data: {
+          userId: req.user.sub,
+          requestNote: request_note || '',
+          requestedAt: new Date().toISOString(),
+          status: 'pending',
+          documents: docSummary,
+          userName,
+          healthId
+        }
+      });
+
+      // Update user profile status
+      const profileRows = await query(
+        `SELECT id, data FROM app_entities WHERE type = 'user_profile' AND user_id = ? LIMIT 1`,
+        [req.user.sub]
+      );
+
+      if (profileRows.length > 0) {
+        const profile = parseJson(profileRows[0].data, {});
+        profile.healthIdStatus = 'pending';
+        await query(`UPDATE app_entities SET data = ? WHERE id = ?`, [JSON.stringify(profile), profileRows[0].id]);
+      }
+
+      // Notify system admins about the new verification request
+      const adminUsers = await query(
+        `SELECT id FROM users WHERE role = 'system_admin'`,
+        []
+      );
+      for (const admin of adminUsers) {
+        await createNotification(admin.id, {
+          type: 'HEALTH_ID_VERIFICATION_REQUEST',
+          entityId: verification.id,
+          title: 'New Health ID Verification Request',
+          message: `${userName} (${healthId}) has submitted a Health ID verification request with ${uploadedDocs.length} document(s).`,
+          link: '/admin/system/health-verifications'
+        });
+      }
+
+      res.status(201).json({
+        success: true,
+        data: {
+          request_id: verification.id,
+          status: 'pending'
+        }
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /hospital/verification-requests – list pending health ID verification requests
+  router.get('/hospital/verification-requests', requireAuth, async (req, res, next) => {
+    try {
+      const statusFilter = req.query.status || 'pending';
+      const requests = await listEntities({ type: 'health_id_verification' });
+
+      const filtered = (requests || [])
+        .filter(r => statusFilter === 'all' ? true : r.status === statusFilter)
+        .sort((a, b) => new Date(b.requestedAt || b.createdAt || 0).getTime() - new Date(a.requestedAt || a.createdAt || 0).getTime());
+
+      // Enrich each request with user info and documents
+      const enriched = await Promise.all(filtered.map(async (r) => {
+        const userId = r.userId || null;
+        let userName = 'Unknown';
+        let userEmail = '';
+        let healthId = '';
+        let documents = r.documents || [];
+
+        if (userId) {
+          const userRows = await query(
+            `SELECT u.email, u.health_id, p.full_name FROM users u LEFT JOIN user_profiles p ON p.user_id = u.id WHERE u.id = ? LIMIT 1`,
+            [userId]
+          );
+          if (userRows.length > 0) {
+            userName = userRows[0].full_name || 'User';
+            userEmail = userRows[0].email || '';
+            healthId = userRows[0].health_id || '';
+          }
+
+          // If no documents stored in entity, fetch them live
+          if (!documents.length) {
+            const userDocs = await listEntities({ type: 'verification_doc', userId });
+            documents = (userDocs || []).filter(d => d.fileUrl).map(d => ({
+              type: d.type || d.subtype,
+              fileName: d.fileName || '',
+              fileUrl: d.fileUrl || '',
+              status: d.status || 'PENDING',
+              uploadedAt: d.uploadedAt || d.createdAt || ''
+            }));
+          }
+        }
+
+        return {
+          id: r.id,
+          userId,
+          hospitalId: r.hospitalId || null,
+          requestNote: r.requestNote || '',
+          requestedAt: r.requestedAt || r.createdAt || null,
+          status: r.status || 'pending',
+          userName: r.userName || userName,
+          userEmail,
+          healthId: r.healthId || healthId,
+          documents
+        };
+      }));
+
+      res.json({ success: true, items: enriched });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // POST /hospital/verification-requests/:id/decision – approve or reject a verification request
+  router.post('/hospital/verification-requests/:id/decision', requireAuth, async (req, res, next) => {
+    try {
+      const { decision, rejection_reason } = req.body || {};
+
+      if (!['accepted', 'rejected'].includes(decision)) {
+        return res.status(400).json({ error: 'decision must be "accepted" or "rejected"' });
+      }
+
+      const existing = await getEntity({ id: req.params.id, type: 'health_id_verification' });
+      if (!existing) {
+        return res.status(404).json({ error: 'Verification request not found' });
+      }
+
+      const newStatus = decision; // 'accepted' or 'rejected' – matches frontend HealthIdVerificationStatus type
+
+      const updated = await updateEntity({
+        id: req.params.id,
+        type: 'health_id_verification',
+        data: {
+          status: newStatus,
+          decidedBy: req.user.sub,
+          decidedAt: new Date().toISOString(),
+          rejectionReason: rejection_reason || null
+        }
+      });
+
+      // Update user profile healthIdStatus
+      if (existing.userId) {
+        const profileRows = await query(
+          `SELECT id, data FROM app_entities WHERE type = 'user_profile' AND user_id = ? LIMIT 1`,
+          [existing.userId]
+        );
+        if (profileRows.length > 0) {
+          const profile = parseJson(profileRows[0].data, {});
+          profile.healthIdStatus = newStatus;
+          await query(`UPDATE app_entities SET data = ? WHERE id = ?`, [JSON.stringify(profile), profileRows[0].id]);
+        }
+
+        // Notify the user about the decision
+        const adminRows = await query(
+          `SELECT p.full_name FROM user_profiles p WHERE p.user_id = ? LIMIT 1`,
+          [req.user.sub]
+        );
+        const adminName = adminRows.length > 0 ? adminRows[0].full_name : 'Admin';
+
+        await createNotification(existing.userId, {
+          type: decision === 'accepted' ? 'HEALTH_ID_VERIFIED' : 'HEALTH_ID_REJECTED',
+          entityId: req.params.id,
+          title: decision === 'accepted' ? 'Health ID Verified!' : 'Health ID Verification Rejected',
+          message: decision === 'accepted'
+            ? 'Your Health ID has been verified. You now have full access to all features.'
+            : `Your Health ID verification was rejected. ${rejection_reason ? 'Reason: ' + rejection_reason : 'Please re-upload your documents and try again.'}`,
+          link: '/profile'
+        });
+      }
+
+      res.json({
+        success: true,
+        data: { status: newStatus }
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Helper function for metric units
+  function getMetricUnit(metricType) {
+    const units = {
+      'Heart Rate': 'bpm',
+      'Weight': 'kg',
+      'Sleep': 'hrs',
+      'Blood Pressure': 'mmHg',
+      'Mood': '',
+      'Steps': 'steps'
+    };
+    return units[metricType] || '';
+  }
+
   return router;
 }
-
-
-
 

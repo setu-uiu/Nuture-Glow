@@ -10,6 +10,20 @@ import { query } from './db.js';
 import { createEntity } from './appStore.js';
 import { normalizeRoleValue, getRoleFilterOptions, getRoleFilterOptionsFromInput, CANONICAL_ROLES } from './roles.js';
 import { sendAccountSuspendedEmail, sendPasswordResetEmail } from './emailService.js';
+import {
+  parseJson,
+  toTrimmedString,
+  normalizeEnumValue,
+  parseBooleanParam,
+  createNotification
+} from './utils/index.js';
+import {
+  sendSuccess,
+  sendCreated,
+  sendError,
+  parsePagination,
+  paginationMeta
+} from './utils/response.js';
 
 export function createAdminRouter({ requireAuth, requireRole }) {
   const router = express.Router();
@@ -24,40 +38,6 @@ export function createAdminRouter({ requireAuth, requireRole }) {
     console.warn('JWT_SECRET is missing or too short. Using a temporary dev secret.');
     return crypto.randomBytes(32).toString('hex');
   })();
-
-  const parseBooleanParam = (value) => {
-    if (value === 'true') return true;
-    if (value === 'false') return false;
-    return undefined;
-  };
-
-  const parseJson = (value, fallback = {}) => {
-    try {
-      return JSON.parse(value || '{}');
-    } catch (err) {
-      return fallback;
-    }
-  };
-
-  const toTrimmedString = (value, maxLen = 5000) => {
-    if (value === null || value === undefined) return '';
-    const str = String(value).trim();
-    if (!str) return '';
-    return str.length > maxLen ? str.slice(0, maxLen) : str;
-  };
-
-  const normalizeEnumValue = (value, allowed) => {
-    if (value === null || value === undefined) return null;
-    const str = String(value).trim();
-    if (allowed.has(str)) return str;
-    const lower = str.toLowerCase();
-    for (const item of allowed) {
-      if (String(item).toLowerCase() === lower) {
-        return item;
-      }
-    }
-    return null;
-  };
 
   const allowedDoctorVerificationStatuses = new Set([
     'PENDING',
@@ -80,20 +60,6 @@ export function createAdminRouter({ requireAuth, requireRole }) {
     'FLAGGED',
     'ESCALATED'
   ]);
-
-  const createNotification = async (userId, payload) => {
-    const notification = {
-      userId,
-      type: payload.type,
-      entityId: payload.entityId,
-      title: payload.title,
-      message: payload.message,
-      link: payload.link,
-      isRead: false,
-      createdAt: new Date().toISOString()
-    };
-    await createEntity({ type: 'notification', userId, data: notification });
-  };
 
   const upsertSystemSetting = async ({ key, value, dataType, description }) => {
     await query(
@@ -581,12 +547,16 @@ export function createAdminRouter({ requireAuth, requireRole }) {
       const [newUsersResult] = await query('SELECT COUNT(*) as count FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)');
       const [securityAlertsResult] = await query('SELECT COUNT(*) as count FROM security_events WHERE severity IN ("critical", "high") AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)');
 
+      // SQL: Calculate average uptime from system_metrics table
+      const uptimeRows = await query('SELECT AVG(uptime_percentage) as avg_uptime FROM system_metrics WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)');
+      const [adminActionsResult] = await query('SELECT COUNT(*) as count FROM admin_actions WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)');
+
       const dashboardData = {
         total_active_users: activeUsersResult?.count || 0,
         new_users_week: newUsersResult?.count || 0,
         critical_security_alerts: securityAlertsResult?.count || 0,
-        avg_uptime_24h: 99.8,
-        admin_actions_24h: 0
+        avg_uptime_24h: uptimeRows[0]?.avg_uptime ? parseFloat(uptimeRows[0].avg_uptime) : 99.8,
+        admin_actions_24h: adminActionsResult?.count || 0
       };
       
       // Get user role breakdown
@@ -605,32 +575,20 @@ export function createAdminRouter({ requireAuth, requireRole }) {
         LIMIT 10
       `);
 
-      // Get system health status (mock data with good defaults)
-      const systemHealth = [
-        {
-          component: 'API Server',
-          status: 'healthy',
-          uptime: 99.98,
-          response: 45
-        },
-        {
-          component: 'Database',
-          status: 'healthy',
-          uptime: 99.95,
-          response: 12
-        },
-        {
-          component: 'Storage',
-          status: 'healthy',
-          uptime: 100,
-          response: 25
-        },
-        {
-          component: 'Email Service',
-          status: 'healthy',
-          uptime: 99.92,
-          response: 150
-        }
+      // SQL: Get system health status from system_metrics table
+      const systemHealthRows = await query(
+        `SELECT metric_name as component,
+                LOWER(status) as status,
+                uptime_percentage as uptime,
+                response_time_ms as response
+         FROM system_metrics
+         ORDER BY id ASC`
+      );
+      const systemHealth = systemHealthRows.length > 0 ? systemHealthRows : [
+        { component: 'API Server', status: 'healthy', uptime: 99.98, response: 45 },
+        { component: 'Database', status: 'healthy', uptime: 99.95, response: 12 },
+        { component: 'Storage', status: 'healthy', uptime: 100, response: 25 },
+        { component: 'Email Service', status: 'healthy', uptime: 99.92, response: 150 }
       ];
 
       // Get recent admin actions

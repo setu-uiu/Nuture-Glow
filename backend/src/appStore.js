@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { query } from './db.js';
-import { SEED_DOCTORS, SEED_HOSPITALS, SEED_MEDICINES, SEED_DONORS } from './appSeeds.js';
+import { SEED_DOCTORS, SEED_HOSPITALS, SEED_MEDICINES, SEED_DONORS, SEED_VACCINE_SCHEDULE } from './appSeeds.js';
 
 const nowIso = () => new Date().toISOString();
 
@@ -229,8 +229,48 @@ export async function listCatalog(type) {
 }
 
 async function seedCatalogType(type, items) {
-  const rows = await query('SELECT COUNT(*) AS count FROM app_catalog WHERE type = ?', [type]);
-  if (rows[0]?.count > 0) return;
+  const rows = await query('SELECT id, data FROM app_catalog WHERE type = ?', [type]);
+  if (rows.length > 0) {
+    if (type !== 'medicine') return;
+
+    const demoIds = new Set(['m1', 'm2', 'm3']);
+    const existingIds = rows.map((row) => row.id);
+    const isDemoOnly = existingIds.length > 0 && existingIds.every((id) => demoIds.has(id));
+
+    const parsedRows = rows.map((row) => {
+      try {
+        return parseRow(row);
+      } catch (err) {
+        return { id: row.id };
+      }
+    });
+
+    const images = parsedRows.map((row) => row?.image || '').filter(Boolean);
+    const picsumCount = images.filter((src) => String(src).includes('picsum.photos/seed/med-')).length;
+    const isPicsumCatalog = images.length > 0 && picsumCount / images.length >= 0.8;
+
+    const seedMap = new Map(items.map((item) => [item.id, item]));
+    const existingMap = new Map(parsedRows.map((item) => [item.id, item]));
+
+    const signature = (item) =>
+      [
+        String(item?.name || ''),
+        String(item?.category || ''),
+        String(item?.image || ''),
+        Number(item?.price || 0)
+      ].join('|');
+
+    const missingSeed = items.some((item) => !existingMap.has(item.id));
+    const extraSeed = parsedRows.some((item) => !seedMap.has(item.id));
+    const mismatchedSeed = items.some((item) => {
+      const existing = existingMap.get(item.id);
+      if (!existing) return true;
+      return signature(existing) !== signature(item);
+    });
+
+    if (!isDemoOnly && !isPicsumCatalog && !missingSeed && !extraSeed && !mismatchedSeed) return;
+    await query('DELETE FROM app_catalog WHERE type = ?', [type]);
+  }
 
   const now = new Date();
   for (const item of items) {
@@ -261,5 +301,6 @@ export async function seedAppData() {
   await seedCatalogType('doctor', SEED_DOCTORS);
   await seedCatalogType('hospital', SEED_HOSPITALS);
   await seedCatalogType('medicine', SEED_MEDICINES);
+  await seedCatalogType('vaccine_schedule', SEED_VACCINE_SCHEDULE);
   await seedDonors();
 }

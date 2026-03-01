@@ -561,6 +561,21 @@ CREATE TABLE IF NOT EXISTS `file_links` (
   FOREIGN KEY (`file_id`) REFERENCES `files` (`id`) ON DELETE CASCADE
 );
 
+-- Chat history table (AI interactions)
+CREATE TABLE IF NOT EXISTS `chat_history` (
+  `id` VARCHAR(36) NOT NULL PRIMARY KEY,
+  `user_id` VARCHAR(36) NOT NULL,
+  `message` TEXT NOT NULL,
+  `response` TEXT NOT NULL,
+  `model_used` VARCHAR(50) NOT NULL,
+  `intent` VARCHAR(50) NULL,
+  `locale` VARCHAR(10) DEFAULT 'en',
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_chat_user_date` (`user_id`, `created_at`),
+  INDEX `idx_chat_model` (`model_used`),
+  FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+);
+
 -- Notifications table (Enhanced with verification workflow support)
 CREATE TABLE IF NOT EXISTS `notifications` (
   `id` VARCHAR(36) NOT NULL PRIMARY KEY,

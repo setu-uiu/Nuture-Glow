@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Environment
+.env
+backend/.env
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+*.log
+dev-start.log
+backend/dev-start.log
+backend/tmp-log.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+backend/nul
+
+# IDE
+.vscode/
+.idea/
+
+# Temp files
+*.tmp
+*.swp

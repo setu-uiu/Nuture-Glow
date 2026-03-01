@@ -4,7 +4,6 @@ import cors from 'cors';
 import morgan from 'morgan';
 import helmet from 'helmet';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
-import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import fs from 'fs/promises';
@@ -12,14 +11,31 @@ import fsSync from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
-import { query } from './db.js';
+import { query, ensureChatHistoryTable, pool } from './db.js';
 import { seedDatabase } from './seed.js';
+import { attachSignaling } from './signaling.js';
 import { createAppRouter } from './appRoutes.js';
 import { createAdminRouter } from './adminRoutes.js';
 import { ensureAppTables, seedAppData, getUserMeta, listEntities, setUserMeta } from './appStore.js';
 import { normalizeRoleValue, CANONICAL_ROLES, getRoleFilterOptions } from './roles.js';
-import { sendPasswordResetEmail, sendWelcomeEmail, sendPasswordResetConfirmationEmail, sendSuspensionAppealEmail, verifyEmailConfig } from './emailService.js';
+import {
+  avatarUpload,
+  buildPublicFileUrl,
+  maxUploadBytes,
+  removeUploadFileByUrl,
+  uploadRoot,
+  verificationDocUpload
+} from './uploads.js';
+import { verifyEmailConfig } from './emailService.js';
 import 'dotenv/config';
+
+// ─── Refactored modules ────────────────────────────────────────────
+import { createAuthMiddleware } from './middleware/auth.js';
+import { sanitizeInput } from './middleware/sanitize.js';
+import { createErrorHandler } from './middleware/errorHandler.js';
+import { createAuthRouter } from './routes/auth.js';
+import { createProfileRouter } from './routes/profile.js';
+import { createHealthRouter } from './routes/health.js';
 
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -55,6 +71,15 @@ const JWT_SECRET = (() => {
   return loadDevJwtSecret();
 })();
 
+const ADMIN_INVITE_CODE = process.env.ADMIN_INVITE_CODE || 'NURTURE_ADMIN_2026';
+
+// Validation helpers now imported from utils — no more duplication
+// (see src/utils/validation.js, src/utils/helpers.js)
+
+// Auth middleware from extracted module
+const { requireAuth, checkSuspensionStatus, requireRole, requireConsentForPatient } =
+  createAuthMiddleware(JWT_SECRET);
+
 const app = express();
 
 if (NODE_ENV === 'production') {
@@ -75,10 +100,16 @@ if (!allowAllOrigins && corsOrigins.length === 0) {
   throw new Error('CORS_ORIGIN resolved to an empty list.');
 }
 
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' }
+  })
+);
 app.use(cors({ origin: allowAllOrigins ? true : corsOrigins }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '15mb' }));
 app.use(morgan('dev'));
+app.use('/uploads', express.static(uploadRoot));
 
 const getTokenUserId = (req) => {
   const header = req.headers.authorization || '';
@@ -94,9 +125,10 @@ const getTokenUserId = (req) => {
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 100,
+  limit: 1000,
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again later.' }
 });
 
 const adminExportLimiter = rateLimit({
@@ -105,32 +137,26 @@ const adminExportLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => getTokenUserId(req) || ipKeyGenerator(req),
-  skip: (req) => !req.path.includes('admin') || !req.path.includes('export')
+  skip: (req) => !req.path.includes('admin') || !req.path.includes('export'),
+  message: { error: 'Too many requests. Please try again later.' }
 });
 
 app.use(apiLimiter);
 app.use(adminExportLimiter);
 
-// Input sanitization middleware
-app.use((req, res, next) => {
-  if (req.body && typeof req.body === 'object') {
-    const sanitize = (obj) => {
-      for (const key in obj) {
-        if (typeof obj[key] === 'string') {
-          // Remove HTML/script tags, trim, and limit length
-          obj[key] = obj[key]
-            .replace(/[<>]/g, '')
-            .trim()
-            .substring(0, 5000);
-        } else if (typeof obj[key] === 'object' && obj[key] !== null) {
-          sanitize(obj[key]);
-        }
-      }
-    };
-    sanitize(req.body);
-  }
-  next();
+// Auth-specific rate limiter (stricter for login/register)
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again in a minute.' }
 });
+app.use('/auth/login', authLimiter);
+app.use('/auth/register', authLimiter);
+
+// Input sanitization (extracted to middleware/sanitize.js)
+app.use(sanitizeInput);
 
 const DB_NAME = process.env.DB_NAME || 'neonest';
 if (NODE_ENV === 'production') {
@@ -161,6 +187,7 @@ const TABLES = [
   'user_profiles',
   'roles',
   'user_roles',
+  'user_oauth_tokens',
   'emergency_contacts',
   'mothers',
   'pregnancies',
@@ -200,6 +227,7 @@ const TABLES = [
   'payments',
   'files',
   'file_links',
+  'chat_history',
   'notifications',
   'audit_logs',
   'addresses',
@@ -214,6 +242,7 @@ const SQL_BOOTSTRAP_FILES = [
   { file: 'database-schema.sql', required: true },
   { file: 'add_role_column.sql', required: false },
   { file: 'create_system_tables.sql', required: true },
+  { file: 'add_oauth_tokens.sql', required: false },
   { file: 'admin_tables_schema.sql', required: true },
   { file: 'create_dashboard_views.sql', required: false }
 ];
@@ -234,6 +263,9 @@ const splitSqlStatements = (sql) =>
     .split(';')
     .map((stmt) => stmt.trim())
     .filter(Boolean);
+
+const LOG_DUPLICATE_SCHEMA_WARNINGS =
+  process.env.LOG_DUPLICATE_SCHEMA_WARNINGS === 'true';
 
 const resolveSqlPath = async (fileName) => {
   const candidates = [
@@ -268,7 +300,9 @@ async function runSqlFile(fileName) {
         msg.includes('Duplicate column name') ||
         msg.includes('already exists')
       ) {
-        console.warn('Ignored duplicate schema error:', msg);
+        if (LOG_DUPLICATE_SCHEMA_WARNINGS) {
+          console.warn('Ignored duplicate schema error:', msg);
+        }
         continue;
       }
       throw err;
@@ -353,156 +387,8 @@ async function getTableMeta(table) {
   return meta;
 }
 
-function requireAuth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) {
-    return res.status(401).json({ error: 'Missing token' });
-  }
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    if (payload && payload.role) {
-      payload.role = normalizeRoleValue(payload.role) || payload.role;
-    }
-    req.user = payload;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
-}
-
-// CRITICAL FIX: Check if user account is suspended
-function checkSuspensionStatus(req, res, next) {
-  return (async () => {
-    try {
-      if (!req.user || !req.user.sub) return next();
-      const rows = await query(
-        `SELECT data FROM app_entities WHERE type = 'user_suspension' AND user_id = ? ORDER BY created_at DESC LIMIT 1`,
-        [req.user.sub]
-      );
-      if (rows.length > 0) {
-        try {
-          const suspension = JSON.parse(rows[0].data || '{}');
-          if (suspension.status === 'suspended') {
-            return res.status(403).json({ error: 'Account suspended', reason: suspension.reason });
-          }
-        } catch (e) {}
-      }
-      next();
-    } catch (err) {
-      console.error('Suspension check error:', err);
-      next();
-    }
-  })();
-}
-
-function requireRole(...allowedRoles) {
-  return async (req, res, next) => {
-    try {
-      if (!req.user || !req.user.sub) {
-        return res.status(401).json({ error: 'Authentication required' });
-      }
-
-      const normalizedAllowed = allowedRoles
-        .flatMap((role) => (Array.isArray(role) ? role : [role]))
-        .map((role) => normalizeRoleValue(role));
-
-      // Get user role directly from users.role column (standardized approach)
-      const rows = await query(
-        `SELECT role FROM users WHERE id = ? LIMIT 1`,
-        [req.user.sub]
-      );
-
-      const rawRole = rows.length > 0 && rows[0].role ? rows[0].role : 'mother';
-      const userRole = normalizeRoleValue(rawRole);
-
-      if (!normalizedAllowed.includes(userRole)) {
-        return res.status(403).json({ 
-          error: 'Insufficient permissions',
-          required: allowedRoles,
-          current: rawRole
-        });
-      }
-
-      req.userRole = userRole;
-      if (req.user) {
-        req.user.role = userRole;
-      }
-      next();
-    } catch (err) {
-      console.error('Role check error:', err);
-      return res.status(500).json({ error: 'Role verification failed' });
-    }
-  };
-}
-
-// ============================================================================
-// CONSENT VALIDATION MIDDLEWARE - Ensures doctors have patient permission
-// ============================================================================
-function requireConsentForPatient(patientIdParam = 'patientId') {
-  return async (req, res, next) => {
-    try {
-      if (!req.user || !req.user.sub) {
-        return res.status(401).json({ error: 'Authentication required' });
-      }
-
-      const doctorId = req.user.sub;
-      const patientId = req.params[patientIdParam] || req.body.patientId;
-
-      if (!patientId) {
-        return res.status(400).json({ error: 'Patient ID required' });
-      }
-
-      // Check for ACTIVE, NON-EXPIRED consent from patient
-      const consentRows = await query(
-        `SELECT id, data FROM app_entities 
-         WHERE type = 'medical_consent' 
-         AND user_id = ?
-         LIMIT 100`,
-        [patientId]
-      );
-
-      const now = new Date();
-      const activeConsent = consentRows.find(row => {
-        try {
-          const consent = JSON.parse(row.data || '{}');
-          
-          // Check if consent is from this doctor
-          if (consent.doctorId !== doctorId) return false;
-          
-          // Check if consent is active
-          if (consent.status !== 'active') return false;
-          
-          // Check if consent has expired
-          if (consent.expiresAt) {
-            const expiryDate = new Date(consent.expiresAt);
-            if (now > expiryDate) return false;
-          }
-          
-          return true;
-        } catch (err) {
-          return false;
-        }
-      });
-
-      if (!activeConsent) {
-        return res.status(403).json({
-          error: 'Access denied: Patient consent required',
-          reason: 'no_active_consent',
-          hint: 'Request patient consent before accessing their medical data'
-        });
-      }
-
-      // Attach consent info to request for logging
-      req.consentId = activeConsent.id;
-      req.consentValidated = true;
-      next();
-    } catch (err) {
-      console.error('Consent validation error:', err);
-      return res.status(500).json({ error: 'Consent verification failed' });
-    }
-  };
-}
+// requireAuth, checkSuspensionStatus, requireRole, requireConsentForPatient
+// are now created via createAuthMiddleware(JWT_SECRET) at the top of this file.
 
 async function getUserProfile(userId) {
   const rows = await query(
@@ -538,502 +424,28 @@ async function getUserProfile(userId) {
   };
 }
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
+// ─── Mount extracted routers ────────────────────────────────────────
+app.use(createHealthRouter());
 
-app.get('/db/ping', async (req, res, next) => {
-  try {
-    const rows = await query('SELECT 1 AS ok');
-    res.json({ ok: rows[0]?.ok === 1 });
-  } catch (err) {
-    next(err);
-  }
-});
+app.use(
+  createAuthRouter({
+    JWT_SECRET,
+    ADMIN_INVITE_CODE,
+    requireAuth,
+    checkSuspensionStatus,
+    getUserProfile
+  })
+);
 
-app.get('/db/tables', async (req, res, next) => {
-  try {
-    const rows = await query('SHOW TABLES');
-    const tables = rows.map(row => Object.values(row)[0]);
-    res.json({ tables });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/auth/register', async (req, res, next) => {
-  try {
-    const { name, email, phone, password, preferred_language, role } = req.body || {};
-    if (!name || !password || !phone) {
-      return res.status(400).json({ error: 'name, phone, and password are required' });
-    }
-
-    const existing = await query(
-      'SELECT id FROM users WHERE email = ? OR phone = ? LIMIT 1',
-      [email || null, phone]
-    );
-    if (existing.length) {
-      return res.status(409).json({ error: 'User already exists' });
-    }
-
-    const userId = uuidv4();
-    const passwordHash = await bcrypt.hash(password, 10);
-    // Standardized role validation - matches frontend UserRole type
-    const normalizedRole = normalizeRoleValue(role) || 'mother';
-    const safeRole = CANONICAL_ROLES.has(normalizedRole) ? normalizedRole : 'mother';
-    const healthId = `NG-${userId.slice(0, 8).toUpperCase()}`;
-
-    await query(
-      'INSERT INTO users (id, phone, email, password_hash, auth_provider, status, role, health_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [userId, phone, email || null, passwordHash, 'local', 'active', safeRole, healthId]
-    );
-
-    await query(
-      'INSERT INTO user_profiles (user_id, full_name, preferred_language) VALUES (?, ?, ?)',
-      [userId, name, preferred_language || 'en']
-    );
-
-    const roleRows = await query('SELECT id FROM roles WHERE role_name = ? LIMIT 1', ['USER']);
-    if (roleRows.length) {
-      await query('INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)', [userId, roleRows[0].id]);
-    }
-
-    const user = await getUserProfile(userId);
-    const token = jwt.sign({ sub: userId, role: user?.role }, JWT_SECRET, { expiresIn: '7d' });
-
-    // Send welcome email (non-blocking)
-    if (email) {
-      sendWelcomeEmail(email, name).catch(err => 
-        console.error('Failed to send welcome email:', err.message)
-      );
-    }
-
-    res.status(201).json({ token, user });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/api/auth/forgot-password', async (req, res, next) => {
-  try {
-    const { email } = req.body || {};
-    if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
-    }
-
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ error: 'Invalid email format' });
-    }
-
-    const rows = await query(
-      'SELECT id, email FROM users WHERE email = ? LIMIT 1',
-      [email.toLowerCase().trim()]
-    );
-
-    // Always return success even if email doesn't exist (security best practice)
-    // This prevents email enumeration attacks
-    if (!rows.length) {
-      console.log(`Password reset requested for non-existent email: ${email}`);
-      return res.json({ 
-        success: true, 
-        message: 'If an account exists with this email, a password reset link has been sent.' 
-      });
-    }
-
-    const user = rows[0];
-    
-    // Generate reset token (valid for 1 hour)
-    const resetToken = jwt.sign(
-      { sub: user.id, purpose: 'password_reset' },
-      JWT_SECRET,
-      { expiresIn: '1h' }
-    );
-
-    // Store reset token in database
-    await query(
-      'INSERT INTO password_reset_tokens (user_id, token, expires_at, created_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR), NOW())',
-      [user.id, resetToken]
-    );
-
-    // Get user profile for name
-    const userProfile = await getUserProfile(user.id);
-    const userName = userProfile?.name || '';
-
-    // Send password reset email
-    let emailResult;
-    try {
-      emailResult = await sendPasswordResetEmail(email, resetToken, userName);
-      console.log(`✓ Password reset email sent to: ${email}`);
-    } catch (emailError) {
-      console.error('Failed to send reset email:', emailError.message);
-      // Continue even if email fails - token is already stored
-    }
-
-    // In development, also log the reset link for easy testing
-    if (process.env.NODE_ENV === 'development') {
-      const resetLink = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset-password?token=${resetToken}`;
-      console.log(`[DEV] Reset link: ${resetLink}`);
-      res.json({ 
-        success: true, 
-        message: 'Password reset link has been sent to your email.',
-        resetLink, // Only in development
-        previewUrl: emailResult?.previewUrl // Test email preview URL
-      });
-    } else {
-      res.json({ 
-        success: true, 
-        message: 'If an account exists with this email, a password reset link has been sent.' 
-      });
-    }
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/api/auth/reset-password', async (req, res, next) => {
-  try {
-    const { token, newPassword, password } = req.body || {};
-    
-    // Accept either newPassword or password for flexibility
-    const pwd = newPassword || password;
-    
-    if (!token || !pwd) {
-      return res.status(400).json({ error: 'Token and new password are required' });
-    }
-
-    // Validate password strength
-    if (pwd.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
-    }
-
-    // Verify token
-    let decoded;
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded.purpose !== 'password_reset') {
-        return res.status(400).json({ error: 'Invalid reset token' });
-      }
-    } catch (err) {
-      return res.status(400).json({ error: 'Invalid or expired reset token' });
-    }
-
-    // Check if token exists and hasn't been used
-    const tokenRows = await query(
-      'SELECT id, user_id, used_at FROM password_reset_tokens WHERE token = ? AND expires_at > NOW() LIMIT 1',
-      [token]
-    );
-
-    if (!tokenRows.length) {
-      return res.status(400).json({ error: 'Invalid or expired reset token' });
-    }
-
-    const tokenRecord = tokenRows[0];
-    
-    if (tokenRecord.used_at) {
-      return res.status(400).json({ error: 'This reset token has already been used' });
-    }
-
-    // Hash new password
-    const passwordHash = await bcrypt.hash(pwd, 10);
-
-    // Update password
-    await query(
-      'UPDATE users SET password_hash = ? WHERE id = ?',
-      [passwordHash, decoded.sub]
-    );
-
-    // Mark token as used
-    await query(
-      'UPDATE password_reset_tokens SET used_at = NOW() WHERE id = ?',
-      [tokenRecord.id]
-    );
-
-    // Get user email and send confirmation
-    const userRows = await query('SELECT email FROM users WHERE id = ? LIMIT 1', [decoded.sub]);
-    if (userRows.length && userRows[0].email) {
-      const userProfile = await getUserProfile(decoded.sub);
-      sendPasswordResetConfirmationEmail(userRows[0].email, userProfile?.name || '').catch(err =>
-        console.error('Failed to send password reset confirmation:', err.message)
-      );
-    }
-
-    res.json({ 
-      success: true, 
-      message: 'Password has been reset successfully. You can now log in with your new password.' 
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/auth/login', async (req, res, next) => {
-  try {
-    const { identifier, password } = req.body || {};
-    if (!identifier || !password) {
-      return res.status(400).json({ error: 'identifier and password are required' });
-    }
-
-    const rows = await query(
-      'SELECT id, password_hash, status FROM users WHERE email = ? OR phone = ? LIMIT 1',
-      [identifier, identifier]
-    );
-
-    if (!rows.length) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const userRow = rows[0];
-
-    const ok = await bcrypt.compare(password, userRow.password_hash || '');
-    if (!ok) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    if (userRow.status !== 'active') {
-      let suspensionDetails = null;
-      if (userRow.status === 'suspended') {
-        try {
-          const suspensions = await query(
-            `SELECT id, data, created_at FROM app_entities WHERE type = 'user_suspension' AND user_id = ? ORDER BY created_at DESC LIMIT 1`,
-            [userRow.id]
-          );
-          if (suspensions.length > 0) {
-            const data = JSON.parse(suspensions[0].data || '{}');
-            suspensionDetails = {
-              id: data.id || suspensions[0].id,
-              reason: data.reason || null,
-              suspendedAt: data.suspendedAt || suspensions[0].created_at
-            };
-          }
-        } catch (e) {}
-      }
-
-      const appealToken = userRow.status === 'suspended'
-        ? jwt.sign(
-            { sub: userRow.id, purpose: 'suspension_appeal' },
-            JWT_SECRET,
-            { expiresIn: '15m' }
-          )
-        : null;
-
-      return res.status(403).json({
-        error: userRow.status === 'suspended' ? 'Account suspended' : 'User is blocked',
-        reason: userRow.status,
-        suspension: suspensionDetails,
-        appeal: userRow.status === 'suspended'
-          ? {
-              enabled: true,
-              token: appealToken,
-              expiresInMinutes: 15,
-              endpoint: '/auth/suspension-appeal'
-            }
-          : { enabled: false }
-      });
-    }
-
-    const user = await getUserProfile(userRow.id);
-    const token = jwt.sign({ sub: userRow.id, role: user?.role }, JWT_SECRET, { expiresIn: '7d' });
-
-    res.json({ token, user });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Submit suspension appeal (show-cause request)
-app.post('/auth/suspension-appeal', async (req, res, next) => {
-  try {
-    const { appealToken, message, identifier } = req.body || {};
-    if (!message) {
-      return res.status(400).json({ error: 'message is required' });
-    }
-
-    let decoded;
-    try {
-      if (!appealToken) {
-        throw new Error('Missing appeal token');
-      }
-      decoded = jwt.verify(appealToken, JWT_SECRET);
-      if (decoded.purpose !== 'suspension_appeal') {
-        return res.status(400).json({ error: 'Invalid appeal token' });
-      }
-    } catch (err) {
-      decoded = null;
-    }
-
-    let userId = decoded?.sub || null;
-    let userRows = [];
-
-    if (!userId && identifier) {
-      userRows = await query(
-        'SELECT id, email, status FROM users WHERE email = ? OR phone = ? LIMIT 1',
-        [identifier, identifier]
-      );
-      if (userRows.length) {
-        userId = userRows[0].id;
-      }
-    }
-
-    if (!userId) {
-      return res.status(400).json({ error: 'Invalid or expired appeal token. Please log in again.' });
-    }
-
-    if (!userRows.length) {
-      userRows = await query(
-        'SELECT id, email, status FROM users WHERE id = ? LIMIT 1',
-        [userId]
-      );
-    }
-
-    if (!userRows.length) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    if (userRows[0].status !== 'suspended') {
-      return res.status(400).json({ error: 'User is not suspended' });
-    }
-
-    const existingAppeals = await query(
-      `SELECT id, data FROM app_entities WHERE type = 'suspension_appeal' AND user_id = ? ORDER BY created_at DESC LIMIT 1`,
-      [userId]
-    );
-    if (existingAppeals.length) {
-      try {
-        const existingData = JSON.parse(existingAppeals[0].data || '{}');
-        if ((existingData.status || 'pending') === 'pending') {
-          return res.json({ success: true, appealId: existingAppeals[0].id, existing: true });
-        }
-      } catch {}
-    }
-
-    const appealId = uuidv4();
-    const now = new Date();
-    const payload = {
-      id: appealId,
-      userId,
-      message,
-      submittedAt: now.toISOString(),
-      status: 'pending'
-    };
-
-    await query(
-      `INSERT INTO app_entities (id, user_id, type, subtype, data, created_at, updated_at)
-       VALUES (?, ?, 'suspension_appeal', NULL, ?, ?, ?)`,
-      [appealId, userId, JSON.stringify(payload), now, now]
-    );
-
-    const savedAppeal = await query(
-      `SELECT id FROM app_entities WHERE id = ? AND type = 'suspension_appeal' LIMIT 1`,
-      [appealId]
-    );
-    if (!savedAppeal.length) {
-      return res.status(500).json({ error: 'Failed to save appeal. Please try again.' });
-    }
-
-    try {
-      const systemRoleOptions = getRoleFilterOptions('system_admin');
-      const systemRolePlaceholders = systemRoleOptions.map(() => '?').join(', ');
-      await query(
-        `INSERT INTO admin_notifications (id, sender_user_id, recipient_user_id, notification_type, priority, title, message, action_required, related_entity_type, related_entity_id)
-         SELECT ?, ?, id, 'SUSPENSION_APPEAL', 'HIGH', ?, ?, TRUE, 'suspension_appeal', ?
-         FROM users WHERE role IN (${systemRolePlaceholders})`,
-        [
-          uuidv4(),
-          userId,
-          'Suspension Appeal Submitted',
-          `A suspended user submitted a show-cause request. Appeal ID: ${appealId}`,
-          appealId,
-          ...systemRoleOptions
-        ]
-      );
-    } catch (notifyErr) {
-      console.warn('Failed to create admin appeal notification:', notifyErr.message);
-    }
-
-    try {
-      const systemRoleOptions = getRoleFilterOptions('system_admin');
-      const systemRolePlaceholders = systemRoleOptions.map(() => '?').join(', ');
-      const admins = await query(
-        `SELECT email FROM users WHERE role IN (${systemRolePlaceholders}) AND email IS NOT NULL`,
-        systemRoleOptions
-      );
-      const userRows = await query(
-        `SELECT u.email, COALESCE(p.full_name, 'User') as full_name
-         FROM users u
-         LEFT JOIN user_profiles p ON p.user_id = u.id
-         WHERE u.id = ? LIMIT 1`,
-        [userId]
-      );
-      const userEmail = userRows[0]?.email || '';
-      const userName = userRows[0]?.full_name || 'User';
-
-      await Promise.all(
-        admins.map((admin) =>
-          sendSuspensionAppealEmail(admin.email, {
-            userEmail,
-            userName,
-            message,
-            appealId,
-            submittedAt: now.toISOString()
-          })
-        )
-      );
-    } catch (emailErr) {
-      console.warn('Failed to send admin appeal email:', emailErr.message);
-    }
-
-    res.json({ success: true, appealId });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get('/auth/me', requireAuth, checkSuspensionStatus, async (req, res, next) => {
-  try {
-    const user = await getUserProfile(req.user.sub);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    res.json({ user });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.put('/profile', requireAuth, async (req, res, next) => {
-  try {
-    const { name, preferred_language } = req.body || {};
-    if (!name && !preferred_language) {
-      return res.status(400).json({ error: 'No updates provided' });
-    }
-
-    await query(
-      'UPDATE user_profiles SET full_name = COALESCE(?, full_name), preferred_language = COALESCE(?, preferred_language) WHERE user_id = ?',
-      [name || null, preferred_language || null, req.user.sub]
-    );
-
-    const user = await getUserProfile(req.user.sub);
-    res.json({ user });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.put('/profile/avatar', requireAuth, async (req, res, next) => {
-  try {
-    const { avatar } = req.body || {};
-    if (!avatar) {
-      return res.status(400).json({ error: 'avatar is required' });
-    }
-    await setUserMeta(req.user.sub, { avatar });
-    const user = await getUserProfile(req.user.sub);
-    res.json({ user });
-  } catch (err) {
-    next(err);
-  }
-});
+app.use(
+  createProfileRouter({
+    requireAuth,
+    avatarUpload,
+    buildPublicFileUrl,
+    removeUploadFileByUrl,
+    getUserProfile
+  })
+);
 
 const adminRouter = createAdminRouter({ requireAuth, requireRole });
 const mapLegacyAdminPath = (prefix) => (req, res, next) => {
@@ -1048,7 +460,17 @@ const mapLegacyAdminPath = (prefix) => (req, res, next) => {
 app.use('/api/admin', adminRouter);
 app.use('/api/system-admin', mapLegacyAdminPath('/system'));
 app.use('/api/ops-admin', mapLegacyAdminPath('/operations'));
-app.use('/api', createAppRouter({ requireAuth, requireRole, requireConsentForPatient }));
+app.use(
+  '/api',
+  createAppRouter({
+    requireAuth,
+    requireRole,
+    requireConsentForPatient,
+    verificationDocUpload,
+    buildPublicFileUrl,
+    removeUploadFileByUrl
+  })
+);
 
 app.get('/admin/tables', requireAuth, requireRole('system_admin'), checkSuspensionStatus, async (req, res, next) => {
   try {
@@ -1236,20 +658,26 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  const status = err.status || 500;
-  const message = err.message || 'Internal server error';
-  res.status(status).json({ error: message });
-});
+// Global error handler (extracted to middleware/errorHandler.js)
+// In production, hides internal error messages from clients.
+app.use(createErrorHandler(maxUploadBytes, NODE_ENV));
 
 const port = Number(process.env.PORT || 4000);
 
 async function bootstrap() {
-  await ensureAdminSchema();
+  // ── Run migration system (replaces ad-hoc SQL bootstrap on first run) ──
+  const { runMigrationsIfPending } = await import('./migrateRunner.js');
+  const migrated = await runMigrationsIfPending();
+
+  // Fall back to legacy SQL bootstrap if no migrations have been applied yet
+  // (e.g. very first run before the baseline migration exists)
+  if (!migrated) {
+    await ensureAdminSchema();
+  }
+
   await assertCoreTables();
   await ensureAppTables();
+  await ensureChatHistoryTable();
   await seedAppData();
   
   // Verify email configuration
@@ -1262,9 +690,35 @@ async function bootstrap() {
     console.warn('  Configure EMAIL_USER and EMAIL_PASSWORD in .env to enable email functionality.');
   }
   
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     console.log(`API listening on http://localhost:${port}`);
   });
+
+  // Attach WebSocket signaling server for WebRTC video calls
+  attachSignaling(server);
+
+  // ── Graceful shutdown ─────────────────────────────────────────────
+  const shutdown = async (signal) => {
+    console.log(`\n${signal} received — shutting down gracefully…`);
+    server.close(async () => {
+      try {
+        await pool.end();
+        console.log('Database pool closed.');
+      } catch (err) {
+        console.error('Error closing database pool:', err.message);
+      }
+      process.exit(0);
+    });
+
+    // Force exit if graceful shutdown takes too long (10 s)
+    setTimeout(() => {
+      console.error('Forced shutdown after timeout.');
+      process.exit(1);
+    }, 10_000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 // Export middleware functions for use in routes
