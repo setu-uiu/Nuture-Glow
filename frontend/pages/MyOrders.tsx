@@ -185,7 +185,7 @@ const MyOrders: React.FC = () => {
                     </div>
 
                     {/* Delivery Address */}
-                    {order.deliveryAddress && (
+                    {order.deliveryAddress && typeof order.deliveryAddress !== 'string' && (
                       <div className="p-4 bg-[#F7F5EF] rounded-xl space-y-1">
                         <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Delivery Address</p>
                         <p className="text-sm font-medium text-gray-800">{order.deliveryAddress.fullName}</p>
@@ -193,6 +193,12 @@ const MyOrders: React.FC = () => {
                         <p className="text-xs text-gray-500">
                           {order.deliveryAddress.streetAddress}, {order.deliveryAddress.area}, {order.deliveryAddress.district}
                         </p>
+                      </div>
+                    )}
+                    {order.deliveryAddress && typeof order.deliveryAddress === 'string' && (
+                      <div className="p-4 bg-[#F7F5EF] rounded-xl space-y-1">
+                        <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Delivery Address</p>
+                        <p className="text-sm text-gray-600">{order.deliveryAddress}</p>
                       </div>
                     )}
 
